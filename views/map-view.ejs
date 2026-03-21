@@ -1,0 +1,253 @@
+<HTML>
+<head>
+    <title>Map View</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/7.0.1/css/all.min.css" integrity="sha512-2SwdPD6INVrV/lHTZbO2nodKhrnDdJK9/kg2XD1r9uGqPo1cUbujc+IYdlYdEErWNu69gVcYgdxlmVmzTWnetw==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+    <script type="text/javascript" src="//cdn.jsdelivr.net/npm/datetimepicker@latest/dist/DateTimePicker.min.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+    <script>
+        //load trackers
+        //var tracker_ids = ;
+
+        // Collect points and format into an efficient map for recall later
+
+        var circleIcon;
+        var pointsArr = [];// ;
+        var points = [];
+        var trackers = [];// ;
+        var DTP;
+        var linesGroup;
+
+        function showPoints(){
+            linesGroup.clearLayers(); // Clear existing lines from the map
+
+            if (pointsArr.length === 0) {
+                return; // No points to display
+            }
+
+            var polyline = L.polyline(pointsArr.map((p) => [p.latitude, p.longitude]), {color: 'red'}).addTo(linesGroup);
+
+            // zoom the map to the polyline
+            map.fitBounds(polyline.getBounds());
+
+            points.forEach(function(point) {
+                var pointIcon = L.divIcon({
+                    className: 'jpico',
+                    html: "<div style='background-color:#4838cc;' class='marker-pin'></div><i style='transform: rotate(" + point.course + "deg)' class='fa-regular fa-circle-up' style='--fa-rotate-angle: 25deg;'></i>",
+                    iconSize: [10, 10],
+                    iconAnchor: [5, 5],
+                    popupAnchor: [-3, -76],
+                });
+
+                //pointIcon.options.html = pointIcon.options.html.replace("GPS_COURSE", point.course);
+
+                var marker = L.marker([point.latitude, point.longitude], {icon: pointIcon}).addTo(linesGroup);
+                marker.on('click', function(event){
+                    var popup = L.popup([point.latitude, point.longitude], {content: "<p>" + loadPopupContentforPoint(point.puid) + "</p>"})
+                    .openOn(map);
+                    console.log("Marker clicked: ", this);
+
+                    loadPopupContentforPoint(point.puid);
+                });
+            });
+
+        }
+
+        function loadPopupContentforPoint(point) {
+            var result = "";
+
+            result += "<strong>" + new Date(points.get(point).time).toLocaleString() + "</strong><br>";
+            result += "Latitude: " + points.get(point).latitude + "<br>";
+            result += "Longitude: " + points.get(point).longitude + "<br>";
+            result += "Velocity: " + points.get(point).velocity + "<br>";
+            result += "Course: " + points.get(point).course + " degrees<br>";
+            result += "Altitude: " + points.get(point).altitude + "<br>";
+            result += "Accuracy: " + points.get(point).gps_accuracy + "<br>";
+            result += "Battery: " + points.get(point).battery + "%<br>";
+            result += "Acceleration: " + points.get(point).acceleration + "<br>";
+            result += "Mode: " + points.get(point).mode + "<br>";
+            return result;
+
+        }
+
+        function loadTrackersAndPoints() {
+            const xhttp = new XMLHttpRequest();
+            xhttp.onload = function() {
+                reponse = JSON.parse(this.responseText);
+                pointsArr = reponse.points;
+                trackers = reponse.tracker_ids;
+                processPoints(pointsArr);
+                processTrackers(trackers);
+                showPoints();
+            }
+            // Get the selected tracker ID from the query or the dropdown
+            var selectedTrackerId = document.getElementById("selTrackers").value || new URLSearchParams(window.location.search).get('tracker_id') || "";
+            xhttp.open("GET", "/points?tracker_id=" + selectedTrackerId + "&seconds_start=" + DTP.getDateObjectForInputField(document.getElementById("start_time_field")).getTime()/1000 + "&seconds_end=" + DTP.getDateObjectForInputField(document.getElementById("end_time_field")).getTime()/1000, true);
+            xhttp.send();
+        }
+
+    
+        function processPoints(pointsArr) {
+            points = pointsArr.reduce((accum, p) => {
+                accum.set(p.puid, p);
+                return accum;
+            }, new Map());
+
+            // 
+        }
+
+        function processTrackers(trackers) {
+            // Process trackers as needed
+            console.log("Received Trackers: ", trackers);
+            var CurSelectedTracker = document.getElementById("selTrackers").value;
+            var queryTrackerId = new URLSearchParams(window.location.search).get('tracker_id');
+            if (queryTrackerId) {
+                CurSelectedTracker = queryTrackerId; // Override with query parameter if present
+            }
+            var selTrackers = document.getElementById("selTrackers");
+            selTrackers.innerHTML = ""; // Clear existing options
+            trackers.forEach(function(tracker_id) {
+                var option = document.createElement("option");
+                if (tracker_id === CurSelectedTracker) {
+                    option.selected = true; // Preserve the currently selected tracker
+                }
+                option.value = tracker_id;
+                option.text = tracker_id;
+                selTrackers.appendChild(option);
+            });
+            if (!trackers.includes(CurSelectedTracker) && trackers.length > 0) {
+                selTrackers.value = trackers[0]; // Select the first tracker if the previously selected one is no longer available
+            }
+        }
+
+        function initMap() {
+            map = L.map('theMap').setView([0, 0], 2);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            }).addTo(map);
+            
+             // Define a custom circle icon
+            circleIcon = L.divIcon({
+                className: 'jpico',
+                html: "<div style='background-color:#4838cc;' class='marker-pin'></div><i style='transform: rotate(GPS_COURSEdeg)' class='fa-regular fa-circle-up' style='--fa-rotate-angle: 25deg;'></i>",
+                iconSize: [10, 10],
+                iconAnchor: [5, 5],
+                popupAnchor: [-3, -76],
+            });
+
+
+            // var circleIcon = L.icon({
+            //     iconUrl: '/map-point.png',
+            //     iconSize: [10, 10],
+            //     iconAnchor: [5, 5],
+            //     popupAnchor: [-3, -76],
+            //     className: 'jpico'
+            // });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {   
+              
+            initMap();   
+
+            $("#dtBox").DateTimePicker(
+				{
+					init: function()
+					{
+						DTP = this;
+					},
+
+					dateTimeFormat: "MM-dd-yyyy hh:mm AA",
+
+					addEventHandlers: function()
+					{
+						var dtPickerObj = this;
+
+						/*
+
+						// Set DateTime Strings for all elements
+			
+						*/
+                        var now = new Date();
+                        var hoursAgo = new Date(now.getTime() - (14 * 60 * 60 * 1000));
+						dtPickerObj.setDateTimeStringInInputField($("#start_time_field"), hoursAgo);
+                        dtPickerObj.setDateTimeStringInInputField($("#end_time_field"), now);
+
+						
+
+						/*
+						
+						// Set DateTime Strings for a single element
+
+						
+						dtPickerObj.setDateTimeStringInInputField($("#date1"), new Date(2014, 4, 25, 0, 0, 0, 0));
+						dtPickerObj.setDateTimeStringInInputField($("#time1"), new Date(2014, 4, 25, 16, 40, 0, 0));
+
+						*/
+
+						/*
+						
+						// Set DateTime Strings for a group of elements
+
+						
+						dtPickerObj.setDateTimeStringInInputField($(".fillDateTime"));
+					
+						*/
+					}
+				});
+            linesGroup = L.layerGroup();
+            linesGroup.addTo(map);
+            loadTrackersAndPoints(); // Initial load of trackers and points
+
+
+        });
+
+    </script>
+    <style>
+        body {
+            padding: 0;
+            margin: 0;
+        }
+        html, body, #map {
+            height: 100%;
+            width: 100vw;
+        }
+    </style>
+
+    <link rel="stylesheet" type="text/css" href="//cdn.jsdelivr.net/npm/datetimepicker@latest/dist/DateTimePicker.min.css" />
+
+</head>
+<BODY>
+    <H1>Map</H1>
+
+    <div style="display: flex; flex-direction: row; align-items: center;">
+        <div style="display: flex; flex-direction: column; align-items: flex-start; margin-right: 20px;">
+            <label for="selTrackers">Tracker:</label>
+            <label for="start_time_field">Start Time:</label>
+            <label for="end_time_field">End Time:</label>
+        </div>
+        <div style="display: flex; flex-direction: column; align-items: flex-start;">
+            <select id="selTrackers"></select>
+            <input id="start_time_field" name="start_time" type="text" data-field="datetime" readonly>
+            <input id="end_time_field" name="end_time" type="text" data-field="datetime" readonly>
+            <button type="button" id="btnSubmit" onclick="loadTrackersAndPoints()" style="align-self: flex-end; margin-top: 10px;">Submit</button>
+        </div>
+    </div>
+
+
+    <!-- 
+    <p>Tracker: </p>
+    <select id="selTrackers"></select>
+    <p>Start Time: </p>
+    <input id="start_time_field" name="start_time" type="text" data-field="datetime" readonly>
+    <p>End Time: </p>
+    <input id="end_time_field" name="end_time" type="text" data-field="datetime" readonly>
+    <button type="button" id="btnSubmit" onclick="loadTrackersAndPoints()">Submit</button> -->
+
+
+     <div id="dtBox"></div>
+    <div id="theMap" style="height: 80vh;"></div>
+</BODY>
+</HTML>
