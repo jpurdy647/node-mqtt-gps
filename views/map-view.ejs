@@ -161,16 +161,27 @@
             // });
         }
 
-        document.addEventListener('DOMContentLoaded', () => {   
-              
+        function initDateTimePicker() {
+            $('input[name="datetimes"]').daterangepicker({
+                timePicker: true,
+                startDate: moment().startOf('hour').add(-14, 'hour'),
+                endDate: moment(),
+                locale: {
+                    format: 'M/DD hh:mm A'
+                }
+            });
+        }
+
+        $(function(){
+
             initMap();   
+            initDateTimePicker();
 
             //TODO INIT DATE TIME PICKER
 
             linesGroup = L.layerGroup();
             linesGroup.addTo(map);
             loadTrackersAndPoints(); // Initial load of trackers and points
-
 
         });
 
@@ -200,19 +211,6 @@
     <H1>Map</H1>
     
     <input type="text" name="datetimes" style="width: 200px;"/>
-
-    <script>
-    $(function() {
-        $('input[name="datetimes"]').daterangepicker({
-            timePicker: true,
-            startDate: moment().startOf('hour').add(1, 'hour'),
-            endDate: moment().startOf('hour').add(-14, 'hour'),
-            locale: {
-            format: 'M/DD hh:mm A'
-            }
-        });
-    });
-    </script>
 
             <label for="selTrackers">Tracker:</label>
             <select id="selTrackers"></select>
