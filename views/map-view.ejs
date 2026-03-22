@@ -4,8 +4,11 @@
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/7.0.1/css/all.min.css" integrity="sha512-2SwdPD6INVrV/lHTZbO2nodKhrnDdJK9/kg2XD1r9uGqPo1cUbujc+IYdlYdEErWNu69gVcYgdxlmVmzTWnetw==" crossorigin="anonymous" referrerpolicy="no-referrer" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
-    <script type="text/javascript" src="//cdn.jsdelivr.net/npm/datetimepicker@latest/dist/DateTimePicker.min.js"></script>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/jquery/latest/jquery.min.js"></script>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/momentjs/latest/moment.min.js"></script>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/daterangepicker/daterangepicker.min.js"></script>
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/daterangepicker/daterangepicker.css" />    
+
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 
     <script>
@@ -28,7 +31,7 @@
                 return; // No points to display
             }
 
-            var polyline = L.polyline(pointsArr.map((p) => [p.latitude, p.longitude]), {color: 'red'}).addTo(linesGroup);
+            var polyline = L.polyline(Array.from(points.values()).map((p) => [p.latitude, p.longitude])).addTo(linesGroup);
 
             // zoom the map to the polyline
             map.fitBounds(polyline.getBounds());
@@ -46,8 +49,18 @@
 
                 var marker = L.marker([point.latitude, point.longitude], {icon: pointIcon}).addTo(linesGroup);
                 marker.on('click', function(event){
-                    var popup = L.popup([point.latitude, point.longitude], {content: "<p>" + loadPopupContentforPoint(point.puid) + "</p>"})
-                    .openOn(map);
+                    var accuracyCircle = L.circle([point.latitude, point.longitude], {
+                        color: 'blue',
+                        fillColor: '#f03',
+                        fillOpacity: 0.5,
+                        radius: point.gps_accuracy
+                    }).addTo(map);
+                    var popup = L.popup([point.latitude, point.longitude], {content: "<p>" + loadPopupContentforPoint(point.puid) + "</p>"});
+                    popup.on('remove', function() {
+                        accuracyCircle.remove(); // Remove the accuracy circle when the popup is closed
+                        console.log("Popup closed for point: ", point.puid);
+                    });
+                    popup.openOn(map);
                     console.log("Marker clicked: ", this);
 
                     loadPopupContentforPoint(point.puid);
@@ -85,14 +98,16 @@
             }
             // Get the selected tracker ID from the query or the dropdown
             var selectedTrackerId = document.getElementById("selTrackers").value || new URLSearchParams(window.location.search).get('tracker_id') || "";
-            xhttp.open("GET", "/points?tracker_id=" + selectedTrackerId + "&seconds_start=" + DTP.getDateObjectForInputField(document.getElementById("start_time_field")).getTime()/1000 + "&seconds_end=" + DTP.getDateObjectForInputField(document.getElementById("end_time_field")).getTime()/1000, true);
+            xhttp.open("GET", "/points?tracker_id=" + selectedTrackerId + "&seconds_start=" + $('input[name="datetimes"]').data('daterangepicker').startDate.toDate().getTime()/1000 + "&seconds_end=" + $('input[name="datetimes"]').data('daterangepicker').endDate.toDate().getTime()/1000, true);
             xhttp.send();
         }
 
     
         function processPoints(pointsArr) {
             points = pointsArr.reduce((accum, p) => {
-                accum.set(p.puid, p);
+                if (p.gps_accuracy <= (document.getElementById("accuracyFilterInput").value || 50)) {
+                    accum.set(p.puid, p);
+                }
                 return accum;
             }, new Map());
 
@@ -102,11 +117,9 @@
         function processTrackers(trackers) {
             // Process trackers as needed
             console.log("Received Trackers: ", trackers);
-            var CurSelectedTracker = document.getElementById("selTrackers").value;
             var queryTrackerId = new URLSearchParams(window.location.search).get('tracker_id');
-            if (queryTrackerId) {
-                CurSelectedTracker = queryTrackerId; // Override with query parameter if present
-            }
+            var CurSelectedTracker = document.getElementById("selTrackers").value || queryTrackerId || ""; // Preserve current selection if possible
+            
             var selTrackers = document.getElementById("selTrackers");
             selTrackers.innerHTML = ""; // Clear existing options
             trackers.forEach(function(tracker_id) {
@@ -152,51 +165,8 @@
               
             initMap();   
 
-            $("#dtBox").DateTimePicker(
-				{
-					init: function()
-					{
-						DTP = this;
-					},
+            //TODO INIT DATE TIME PICKER
 
-					dateTimeFormat: "MM-dd-yyyy hh:mm AA",
-
-					addEventHandlers: function()
-					{
-						var dtPickerObj = this;
-
-						/*
-
-						// Set DateTime Strings for all elements
-			
-						*/
-                        var now = new Date();
-                        var hoursAgo = new Date(now.getTime() - (14 * 60 * 60 * 1000));
-						dtPickerObj.setDateTimeStringInInputField($("#start_time_field"), hoursAgo);
-                        dtPickerObj.setDateTimeStringInInputField($("#end_time_field"), now);
-
-						
-
-						/*
-						
-						// Set DateTime Strings for a single element
-
-						
-						dtPickerObj.setDateTimeStringInInputField($("#date1"), new Date(2014, 4, 25, 0, 0, 0, 0));
-						dtPickerObj.setDateTimeStringInInputField($("#time1"), new Date(2014, 4, 25, 16, 40, 0, 0));
-
-						*/
-
-						/*
-						
-						// Set DateTime Strings for a group of elements
-
-						
-						dtPickerObj.setDateTimeStringInInputField($(".fillDateTime"));
-					
-						*/
-					}
-				});
             linesGroup = L.layerGroup();
             linesGroup.addTo(map);
             loadTrackersAndPoints(); // Initial load of trackers and points
@@ -210,10 +180,17 @@
             padding: 0;
             margin: 0;
         }
-        html, body, #map {
+        html, body{
             height: 100%;
             width: 100vw;
         }
+        #map {
+            position: absolute;
+            top: 200px;
+            bottom: 0;
+            right: 0;
+            left: 0;
+    }
     </style>
 
     <link rel="stylesheet" type="text/css" href="//cdn.jsdelivr.net/npm/datetimepicker@latest/dist/DateTimePicker.min.css" />
@@ -221,21 +198,27 @@
 </head>
 <BODY>
     <H1>Map</H1>
+    
+    <input type="text" name="datetimes" style="width: 200px;"/>
 
-    <div style="display: flex; flex-direction: row; align-items: center;">
-        <div style="display: flex; flex-direction: column; align-items: flex-start; margin-right: 20px;">
+    <script>
+    $(function() {
+        $('input[name="datetimes"]').daterangepicker({
+            timePicker: true,
+            startDate: moment().startOf('hour').add(1, 'hour'),
+            endDate: moment().startOf('hour').add(-14, 'hour'),
+            locale: {
+            format: 'M/DD hh:mm A'
+            }
+        });
+    });
+    </script>
+
             <label for="selTrackers">Tracker:</label>
-            <label for="start_time_field">Start Time:</label>
-            <label for="end_time_field">End Time:</label>
-        </div>
-        <div style="display: flex; flex-direction: column; align-items: flex-start;">
             <select id="selTrackers"></select>
-            <input id="start_time_field" name="start_time" type="text" data-field="datetime" readonly>
-            <input id="end_time_field" name="end_time" type="text" data-field="datetime" readonly>
+            <label for="accuracyFilterInput">Accuracy Limit: </label>
+            <input id="accuracyFilterInput" type="number" value="50" style="width: 40px;">
             <button type="button" id="btnSubmit" onclick="loadTrackersAndPoints()" style="align-self: flex-end; margin-top: 10px;">Submit</button>
-        </div>
-    </div>
-
 
     <!-- 
     <p>Tracker: </p>
@@ -247,7 +230,6 @@
     <button type="button" id="btnSubmit" onclick="loadTrackersAndPoints()">Submit</button> -->
 
 
-     <div id="dtBox"></div>
     <div id="theMap" style="height: 80vh;"></div>
 </BODY>
 </HTML>
