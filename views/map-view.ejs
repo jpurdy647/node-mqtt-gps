@@ -12,22 +12,52 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 
     <script>
+
+        function calculateDistance(lat1, lon1, lat2, lon2, unit = 'km') {
+            const R = 6371; // Radius of the Earth in kilometers
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+
+            const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                        Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+            let distance = R * c; // Distance in kilometers
+
+            // Convert to other units if needed
+            if (unit === 'miles') distance = distance * 0.621371;
+            if (unit === 'meters') distance = distance * 1000;
+
+            return distance;
+        }
+
+
         //load trackers
         //var tracker_ids = ;
 
         // Collect points and format into an efficient map for recall later
 
         var circleIcon;
-        var pointsArr = [];// ;
-        var points = [];
+        var points = new Map();
         var trackers = [];// ;
         var DTP;
         var linesGroup;
 
+        const Transition = {
+            STOP_TO_MOVING: "STOP_TO_MOVING",
+            MOVING_TO_STOP: "MOVING_TO_STOP",
+        }
+
+        const Mode = {
+            MOVING: "MOVING",
+            STOP: "STOP",
+        }
+
         function showPoints(){
             linesGroup.clearLayers(); // Clear existing lines from the map
 
-            if (pointsArr.length === 0) {
+            if (points.size === 0) {
                 return; // No points to display
             }
 
@@ -69,19 +99,20 @@
 
         }
 
-        function loadPopupContentforPoint(point) {
+        function loadPopupContentforPoint(pointPIUD) {
+            const point = points.get(pointPIUD);
             var result = "";
 
-            result += "<strong>" + new Date(points.get(point).time).toLocaleString() + "</strong><br>";
-            result += "Latitude: " + points.get(point).latitude + "<br>";
-            result += "Longitude: " + points.get(point).longitude + "<br>";
-            result += "Velocity: " + points.get(point).velocity + "<br>";
-            result += "Course: " + points.get(point).course + " degrees<br>";
-            result += "Altitude: " + points.get(point).altitude + "<br>";
-            result += "Accuracy: " + points.get(point).gps_accuracy + "<br>";
-            result += "Battery: " + points.get(point).battery + "%<br>";
-            result += "Acceleration: " + points.get(point).acceleration + "<br>";
-            result += "Mode: " + points.get(point).mode + "<br>";
+            result += "<strong>" + new Date(point.time).toLocaleString() + "</strong><br>";
+            result += "Latitude: " + point.latitude + "<br>";
+            result += "Longitude: " + point.longitude + "<br>";
+            result += "Velocity: " + point.velocity + "<br>";
+            result += "Course: " + point.course + " degrees<br>";
+            result += "Altitude: " + point.altitude + "<br>";
+            result += "Accuracy: " + point.gps_accuracy + "<br>";
+            result += "Battery: " + point.battery + "%<br>";
+            result += "Acceleration: " + point.acceleration + "<br>";
+            result += "Mode: " + point.mode + "<br>";
             return result;
 
         }
@@ -89,11 +120,9 @@
         function loadTrackersAndPoints() {
             const xhttp = new XMLHttpRequest();
             xhttp.onload = function() {
-                reponse = JSON.parse(this.responseText);
-                pointsArr = reponse.points;
-                trackers = reponse.tracker_ids;
-                processPoints(pointsArr);
-                processTrackers(trackers);
+                reponse = JSON.parse(this.responseText);;
+                processPoints(reponse.points);
+                processTrackers(reponse.tracker_ids);
                 showPoints();
             }
             // Get the selected tracker ID from the query or the dropdown
@@ -106,12 +135,140 @@
         function processPoints(pointsArr) {
             points = pointsArr.reduce((accum, p) => {
                 if (p.gps_accuracy <= (document.getElementById("accuracyFilterInput").value || 50)) {
+                    p.localTime = new Date(p.time).toLocaleString();
                     accum.set(p.puid, p);
                 }
                 return accum;
             }, new Map());
 
             // 
+            }
+
+            function processSegments2(pointsMap){
+                //use speed rather than point density to detect stops
+
+
+                var pointsArr = Array.from(pointsMap.values());
+                var mode = Mode.MOVING; // Initial mode
+
+                const stoppedSpeedThreshold = 1; // Speed threshold to consider as stopped (adjust as needed)
+
+                for (let i = 0; i < pointsArr.length; i++) {
+                    console.log(`Processing point ${i} with puid ${pointsArr[i].puid} in mode ${mode}`);
+                    console.log(`Current point: `, pointsArr[i]);
+                    var distance = calculateDistance(pointsArr[i].latitude, pointsArr[i].longitude, pointsArr[Math.max(0, i-1)].latitude, pointsArr[Math.max(0, i-1)].longitude, 'meters');
+                    var time = (new Date(pointsArr[i].time).getTime() - new Date(pointsArr[Math.max(0, i-1)].time).getTime()) / 1000; // Time difference in seconds
+                    var speed = Math.abs(distance / time); // Speed in meters per second
+                    var speedMPH = speed * 2.23694; // Convert speed to miles per hour
+                    console.log(`Distance: ${distance} meters, Time: ${time} seconds, Speed: ${speed} m/s, MPH: ${speedMPH}`);
+                    
+
+                    if (mode === Mode.MOVING) {
+                        if (speedMPH <= stoppedSpeedThreshold) {
+                            console.log(`Transition from MOVING to STOP at point ${pointsArr[i].puid}`);
+                            console.log(pointsArr[i]);
+                            //add a marker to the map for the stopped point
+                            map.addLayer(L.marker([pointsArr[i].latitude, pointsArr[i].longitude]).bindPopup("Stopping Point: " + new Date(pointsArr[i].time).toLocaleString()).addTo(map));
+                            mode = Mode.STOP;
+                        }
+                    } else if (mode === Mode.STOP) {
+                        if (speedMPH > stoppedSpeedThreshold) {
+                            console.log(`Transition from STOP to MOVING at point ${pointsArr[i].puid}`);
+                            console.log(pointsArr[i]);
+                            //add a marker to the map for the stopped point
+                            map.addLayer(L.marker([pointsArr[i].latitude, pointsArr[i].longitude]).bindPopup("Moving Point: " + new Date(pointsArr[i].time).toLocaleString()).addTo(map));
+                            mode = Mode.MOVING;
+                        }
+                    }
+                }
+            }
+
+        function processSegments(pointsMap) {
+
+            var pointsArr = Array.from(pointsMap.values());
+
+            var mode = Mode.MOVING; // Initial mode
+
+            const runningAverageWindow = 5; // Number of points to consider for the running average
+            var runningAveragePoints = [];
+            var runningAverageLoc = {
+                latitude: 0,
+                longitude: 0,
+            };
+            var stoppedPointCount = 0;
+            var movingPointCount = 0;
+            const stoppedPointDistanceThreshold = 100; // Number of consecutive points below speed threshold to consider as stopped
+
+            for (let i = 0; i < pointsArr.length; i++) {
+                console.log(`Processing point ${i} with puid ${pointsArr[i].puid} in mode ${mode}`);
+                console.log(`Current point: `, pointsArr[i]);
+                console.log(`Running average location: `, runningAverageLoc);
+                console.log(`Distance from running average: `, calculateDistance(pointsArr[i].latitude, pointsArr[i].longitude, runningAverageLoc.latitude, runningAverageLoc.longitude, 'meters'));
+                console.log(`Stopped point count: ${stoppedPointCount}`);
+                console.log(`Moving point count: ${movingPointCount}`);
+
+                if (mode ===Mode.MOVING) {
+                    runningAveragePoints.push(pointsArr[i]);
+                    if (runningAveragePoints.length > runningAverageWindow) {
+                        runningAveragePoints.shift(); // Remove the oldest point to maintain the window size
+                    }
+                    runningAverageLoc.latitude = runningAveragePoints.reduce((sum, p) => sum + p.latitude, 0) / runningAveragePoints.length;
+                    runningAverageLoc.longitude = runningAveragePoints.reduce((sum, p) => sum + p.longitude, 0) / runningAveragePoints.length;
+
+                    var distance = calculateDistance(pointsArr[i].latitude, pointsArr[i].longitude, runningAverageLoc.latitude, runningAverageLoc.longitude, 'meters');
+
+                    if ((runningAverageLoc.latitude != 0) && (distance < stoppedPointDistanceThreshold)) {
+                        stoppedPointCount++;
+                    } else {
+                        stoppedPointCount = 0; // Reset count if movement is detected
+                    }
+
+                    if (stoppedPointCount > runningAverageWindow) { // Threshold for stopping, adjust as needed
+                        console.log(`Transition from STOP to MOVING at point ${pointsArr[i- runningAverageWindow].puid}`);
+                        console.log(pointsArr[i- runningAverageWindow]);
+                        //add a marker to the map for the stopped point
+                        map.addLayer(L.marker([pointsArr[i- runningAverageWindow].latitude, pointsArr[i- runningAverageWindow].longitude]).bindPopup("Stopping Point: " + new Date(pointsArr[i- runningAverageWindow].time).toLocaleString()).addTo(map));
+                        mode = Mode.STOP;
+                        //i -= runningAverageWindow; // Re-evaluate points in the new moderunningAvergaePoints = [];
+                        
+                        // runningAveragePoints = [];
+                        // runningAverageLoc = {
+                        //     latitude: 0,
+                        //     longitude: 0,
+                        // }; //reset running average and location when stopping
+                    }
+                } else if (mode === Mode.STOP) {
+                    runningAveragePoints.push(pointsArr[i]);
+                    if (runningAveragePoints.length > runningAverageWindow) {
+                        runningAveragePoints.shift(); // Remove the oldest point to maintain the window size
+                    }
+                    runningAverageLoc.latitude = runningAveragePoints.reduce((sum, p) => sum + p.latitude, 0) / runningAveragePoints.length;
+                    runningAverageLoc.longitude = runningAveragePoints.reduce((sum, p) => sum + p.longitude, 0) / runningAveragePoints.length;
+
+                    var distance = calculateDistance(pointsArr[i].latitude, pointsArr[i].longitude, runningAverageLoc.latitude, runningAverageLoc.longitude, 'meters');
+
+                    if (distance >= stoppedPointDistanceThreshold) {
+                        movingPointCount++;
+                    } else {
+                        movingPointCount = 0; // Reset count if movement is detected
+                    }
+
+                    if (movingPointCount > runningAverageWindow) { // Threshold for stopping, adjust as needed
+                        console.log(`Transition from MOVING to STOP at point ${pointsArr[i- runningAverageWindow].puid}`);
+                        console.log(pointsArr[i- runningAverageWindow]);
+                        //add a marker to the map for the stopped point
+                        map.addLayer(L.marker([pointsArr[i- runningAverageWindow].latitude, pointsArr[i- runningAverageWindow].longitude]).bindPopup("Moving Point: " + new Date(pointsArr[i- runningAverageWindow].time).toLocaleString()).addTo(map));
+                        mode = Mode.MOVING;
+                        //i -= runningAverageWindow; // Re-evaluate points in the new moderunningAvergaePoints = [];
+                        
+                        // runningAveragePoints = [];
+                        // runningAverageLoc = {
+                        //     latitude: 0,
+                        //     longitude: 0,
+                        // }; //reset running average and location when stopping
+                    }
+                }
+            }
         }
 
         function processTrackers(trackers) {
