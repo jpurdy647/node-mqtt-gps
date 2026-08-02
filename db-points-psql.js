@@ -11,18 +11,15 @@ Date format: RFC3339 UTC
 
 
 
-const JP_PSQL_HOST = "10.10.1.2";
-const JP_PSQL_PORT = "5432";
-const JP_PSQL_DB = "gps_data";
-const JP_PSQL_USER = "josh";
-const JP_PSQL_PASS = "REDACTED_SECRET";
-
-
-
-
 const { error } = require('node:console');
 const { Pool } = require('pg');
 require('dotenv').config();
+
+const JP_PSQL_HOST = process.env.PSQL_HOST || '127.0.0.1';
+const JP_PSQL_PORT = parseInt(process.env.PSQL_PORT || '5432', 10);
+const JP_PSQL_DB = process.env.PSQL_DB || 'gps_data';
+const JP_PSQL_USER = process.env.PSQL_USER;
+const JP_PSQL_PASS = process.env.PSQL_PASS;
 
 const pool = new Pool({
   user: JP_PSQL_USER,

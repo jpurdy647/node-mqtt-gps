@@ -1,18 +1,19 @@
 const mqtt = require('mqtt');
 const Influx = require('influx');
+require('dotenv').config();
 
-const protocol = 'mqtt';
-const host = '10.10.1.12';
-const port = '1883';
-const username = 'node_tracker';
-const password = 'REDACTED_SECRET';
+const protocol = process.env.MQTT_PROTOCOL || 'mqtt';
+const host = process.env.MQTT_HOST || '127.0.0.1';
+const port = process.env.MQTT_PORT || '1883';
+const username = process.env.MQTT_USERNAME;
+const password = process.env.MQTT_PASSWORD;
 const clientId = `node_trackermqtt_${Math.random().toString(16).slice(3)}`;
 
 const connectUrl = `${protocol}://${host}:${port}`;
 
-const JP_INFLUX_HOST = '10.10.1.2';
-const JP_INFLUX__PORT = '8086';
-const JP_INFLUX_DB = 'ha';
+const JP_INFLUX_HOST = process.env.INFLUX_HOST || '127.0.0.1';
+const JP_INFLUX__PORT = process.env.INFLUX_PORT || '8086';
+const JP_INFLUX_DB = process.env.INFLUX_DB || 'ha';
 
 const influx = new Influx.InfluxDB({
     host: JP_INFLUX_HOST,

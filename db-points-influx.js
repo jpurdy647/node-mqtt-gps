@@ -9,12 +9,13 @@ Date format: RFC3339 UTC
 
 */
 
-Influx = require("influx");
+const Influx = require("influx");
+require('dotenv').config();
 
 
-const JP_INFLUX_HOST = "10.10.1.2";
-const JP_INFLUX__PORT = "8086";
-const JP_INFLUX_DB = "ha";
+const JP_INFLUX_HOST = process.env.INFLUX_HOST || '127.0.0.1';
+const JP_INFLUX__PORT = process.env.INFLUX_PORT || '8086';
+const JP_INFLUX_DB = process.env.INFLUX_DB || 'ha';
 
 
 class pointsDBConnector {
