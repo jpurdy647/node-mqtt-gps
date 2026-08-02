@@ -17,14 +17,16 @@ const app = express();
 app.set('view engine', 'ejs'); // Sets EJS as the template engine
 app.set('views', __dirname + '/views'); // Sets the views directory
 app.use(express.static('assets')); // Serves static files from the 'assets' directory
+app.use(express.json());
 
 const pointsDBConnector = require("./db-points-psql");
 const TracksProcessor = require("./TracksProcessor");
+const mqttManualUpdates = require("./mqtt");
 
 
 const pointsDB = new pointsDBConnector();
 
-app.listen(3001, () => {
+app.listen(3000, () => {
   console.log(`App listening on port 3001`)
 })
 
@@ -48,50 +50,49 @@ app.get("/map", function (req, res) {
 
 app.get("/points",[
     check('tracker_id', 'seconds_start', 'seconds_end', 'hours').trim().escape() // Sanitizes and escapes the 'searchQuery' parameter
-  ], function (req, res) {
+  ], async function (req, res) {
   console.log("Received points request with query parameters:", req.query);
-  var trackers = [];
-  var points = 
-  pointsDB.getDistinctTrackers().then((result) => {
-    console.log("Distinct trackers from DB:", result.rows);
-    trackers = result.rows.map(r => r.tracker_id); // Extract just the tracker_id values
-    console.log("Extracted tracker IDs:", trackers);
-  }).then(() => {
-    if (req.query.hours && req.query.tracker_id) {
-      var now = new Date();
-      var seconds_end = now.getTime() / 1000;
-      var seconds_start = seconds_end - (parseInt(req.query.hours) || 24) * 60 * 60;
-      var qp = pointsDB.queryPoints(seconds_start, seconds_end, req.query.tracker_id);
-      console.log("qp: ", qp);
-      return qp;
-    } else if (req.query.seconds_start && req.query.seconds_end && req.query.tracker_id) {
-      return pointsDB.queryPoints(req.query.seconds_start, req.query.seconds_end, req.query.tracker_id);
-    } else if (req.query.seconds_start && req.query.tracker_id) {
-      return pointsDB.queryPoints(req.query.seconds_start, new Date().getTime() / 1000, req.query.tracker_id);
-    } else if (req.query.tracker_id) {
-      var now = new Date();
-      var seconds_end = now.getTime() / 1000;
-      var seconds_start = seconds_end - (24 * 60 * 60);
-      return pointsDB.queryPoints(seconds_start, seconds_end, req.query.tracker_id);
+
+  try {
+    const selectedTrackerId = req.query.tracker_id;
+    let trackerIds = [];
+
+    if (selectedTrackerId && selectedTrackerId !== "all_trackers") {
+      trackerIds = [selectedTrackerId];
     } else {
-      //return PromiseRejectionEvent("No valid query parameters provided. Please provide either 'tracker_id' with optional 'hours', or 'tracker_id' with 'seconds_start' and optionally 'seconds_end'.");
+      trackerIds = await pointsDB.getDistinctTrackers();
     }
-  })
-  .then((result) => {
-    if (result){
-      console.log("Raw points from DB:", result);
-      const processedPoints = TracksProcessor.processPath(result);
-      console.log("Processed points for map:", processedPoints);
-      res.json({ points: processedPoints, tracker_ids: trackers });
+
+    let seconds_start;
+    let seconds_end;
+
+    if (req.query.hours && selectedTrackerId) {
+      const now = new Date();
+      seconds_end = now.getTime() / 1000;
+      seconds_start = seconds_end - (parseInt(req.query.hours) || 24) * 60 * 60;
+    } else if (req.query.seconds_start && req.query.seconds_end && selectedTrackerId) {
+      seconds_start = req.query.seconds_start;
+      seconds_end = req.query.seconds_end;
+    } else if (req.query.seconds_start && selectedTrackerId) {
+      seconds_start = req.query.seconds_start;
+      seconds_end = new Date().getTime() / 1000;
+    } else if (selectedTrackerId) {
+      const now = new Date();
+      seconds_end = now.getTime() / 1000;
+      seconds_start = seconds_end - (24 * 60 * 60);
     } else {
-      //TODO
-      console.warn("No points found for the given query parameters.");
-      console.warn("Result:", result);
-      res.json({ points: [], tracker_ids: trackers });
+      const now = new Date();
+      seconds_end = now.getTime() / 1000;
+      seconds_start = seconds_end - (24 * 60 * 60);
     }
-  }).catch((err) => {
+
+    const result = await pointsDB.queryPoints(seconds_start, seconds_end, trackerIds);
+    const processedPoints = TracksProcessor.processPath(result);
+    res.json({ trackers: processedPoints, tracker_ids: trackerIds });
+  } catch (err) {
+    console.error("Error processing points request:", err);
     res.status(500).send(err.stack);
-  });
+  }
 });
 
 
@@ -106,14 +107,38 @@ app.get("/times", [
 });
 
 app.get("/trackers", function (req, res) {
-  pointsDB.getDistinctTrackers().then((result) => {
-    res.json(result.map(r => r.value)); // Extract just the tracker_id values
+  console.log("Received request for distinct trackers");
+  pointsDB.getDistinctTrackers().then((trackers) => {
+    console.log("Trackers from DB:", trackers);
+    res.json(trackers);
   }).catch((err) => {
-    res.status(500).send(err.stack);
+    console.error("Error fetching trackers:", err);
+    res.status(500).json({ error: "Failed to fetch trackers" });
   });
 });
 
-/**
- * Now, we'll make sure the database exists and boot the app.
- */
+app.post("/api/mqtt/manual-updates/watch", function (req, res) {
+  try {
+    const { clientId, intervalSeconds } = req.body || {};
+    const status = mqttManualUpdates.registerManualUpdateWatcher(clientId, intervalSeconds);
+    res.json({ ok: true, status });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
 
+app.post("/api/mqtt/manual-updates/keepalive", function (req, res) {
+  const { clientId } = req.body || {};
+  const active = mqttManualUpdates.keepAliveManualUpdateWatcher(clientId);
+  res.json({ ok: true, active, status: mqttManualUpdates.getManualUpdateStatus() });
+});
+
+app.post("/api/mqtt/manual-updates/unwatch", function (req, res) {
+  const { clientId } = req.body || {};
+  const removed = mqttManualUpdates.unregisterManualUpdateWatcher(clientId);
+  res.json({ ok: true, removed, status: mqttManualUpdates.getManualUpdateStatus() });
+});
+
+app.get("/api/mqtt/manual-updates/status", function (req, res) {
+  res.json({ ok: true, status: mqttManualUpdates.getManualUpdateStatus() });
+});

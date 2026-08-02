@@ -1,32 +1,27 @@
 const mqtt = require('mqtt');
-const { time } = require('node:console');
-const { write } = require('node:fs');
+const Influx = require('influx');
 
-const protocol = 'mqtt'
-const host = '10.10.1.12'
-const port = '1883'
+const protocol = 'mqtt';
+const host = '10.10.1.12';
+const port = '1883';
 const username = 'node_tracker';
 const password = 'REDACTED_SECRET';
-const clientId = `node_trackermqtt_${Math.random().toString(16).slice(3)}`
+const clientId = `node_trackermqtt_${Math.random().toString(16).slice(3)}`;
 
-const connectUrl = `${protocol}://${host}:${port}`
+const connectUrl = `${protocol}://${host}:${port}`;
 
-
-
-Influx = require("influx");
-
-const JP_INFLUX_HOST = "10.10.1.2";
-const JP_INFLUX__PORT = "8086";
-const JP_INFLUX_DB = "ha";
+const JP_INFLUX_HOST = '10.10.1.2';
+const JP_INFLUX__PORT = '8086';
+const JP_INFLUX_DB = 'ha';
 
 const influx = new Influx.InfluxDB({
-          host: JP_INFLUX_HOST,
-          port: JP_INFLUX__PORT,
-          database: JP_INFLUX_DB,
-          schema: [
-            {
-              measurement: "gps_data",
-              fields: {
+    host: JP_INFLUX_HOST,
+    port: JP_INFLUX__PORT,
+    database: JP_INFLUX_DB,
+    schema: [
+        {
+            measurement: 'gps_data',
+            fields: {
                 latitude: Influx.FieldType.FLOAT,
                 longitude: Influx.FieldType.FLOAT,
                 altitude: Influx.FieldType.FLOAT,
@@ -36,116 +31,267 @@ const influx = new Influx.InfluxDB({
                 course: Influx.FieldType.FLOAT,
                 acceleration: Influx.FieldType.FLOAT,
                 vertical_accuracy: Influx.FieldType.FLOAT,
-              },
-              tags: ["round_lat", "round_lon", "tracker_id", "mode"],
             },
-          ],
-      });
+            tags: ['round_lat', 'round_lon', 'tracker_id', 'mode'],
+        },
+    ],
+});
 
 function writeGpsDataToInflux(gpsData) {
-const { time, tid, latitude, longitude, altitude, gps_accuracy, battery, velocity, course, acceleration, vertical_accuracy, mode } = gpsData;
-const round_lat = Math.round(latitude * 100) / 100;
-const round_lon = Math.round(longitude * 100) / 100;
+    const {
+        time,
+        tid,
+        latitude,
+        longitude,
+        altitude,
+        gps_accuracy,
+        battery,
+        velocity,
+        course,
+        acceleration,
+        vertical_accuracy,
+        mode,
+    } = gpsData;
 
-console.log("Writing GPS data to InfluxDB:", {
-    time,
-    tid,
-    latitude,
-    longitude,
-    altitude,
-    gps_accuracy,
-    battery,
-    velocity,
-    course,
-    acceleration,
-    vertical_accuracy,
-    mode,
-    round_lat,
-    round_lon
-});
+    const round_lat = Math.round(latitude * 100) / 100;
+    const round_lon = Math.round(longitude * 100) / 100;
 
     influx.writePoints([
         {
             measurement: 'gps_data',
-            tags: { 
+            tags: {
                 tracker_id: tid.toString(),
                 round_lat: round_lat.toString(),
                 round_lon: round_lon.toString(),
-                mode: mode.toString()
+                mode: mode.toString(),
             },
-            fields: { 
-                altitude: altitude,
-                latitude: latitude,
-                longitude: longitude,
-                gps_accuracy: gps_accuracy,
-                battery: battery,
-                velocity: velocity,
-                course: course,
-                acceleration: acceleration,
-                vertical_accuracy: vertical_accuracy,
+            fields: {
+                altitude,
+                latitude,
+                longitude,
+                gps_accuracy,
+                battery,
+                velocity,
+                course,
+                acceleration,
+                vertical_accuracy,
             },
-            time: new Date(time * 1000).getMilliseconds()*1000 // Convert Unix timestamp to JavaScript Date object
-        }
-    ]).then(() => {
-        console.log('GPS data written to InfluxDB successfully');
-    }).catch((error) => {
+            time: new Date(time * 1000).getMilliseconds() * 1000,
+        },
+    ]).catch((error) => {
         console.error('Error writing GPS data to InfluxDB:', error);
     });
 }
 
+const MANUAL_COMMANDS = [
+    { topic: 'owntracks/alana/alanaphone/cmd', payload: '{"_type":"cmd","action":"reportLocation"}' },
+    { topic: 'owntracks/josh/JPGraphene/cmd', payload: '{"_type":"cmd","action":"reportLocation"}' },
+    { topic: 'owntracks/lane/NLPGraphene/cmd', payload: '{"_type":"cmd","action":"reportLocation"}' },
+    { topic: 'owntracks/lisa/llp/cmd', payload: '{"_type":"cmd","action":"reportLocation"}' },
+];
 
+const KEEPALIVE_TIMEOUT_MS = 30 * 1000;
+const KEEPALIVE_RECOMMENDED_SECONDS = 20;
+const MIN_INTERVAL_SECONDS = 5;
+const MAX_INTERVAL_SECONDS = 3600;
 
+const updateWatchers = new Map();
+let manualCommandIntervalHandle = null;
+let currentEffectiveIntervalMs = null;
+
+function toSafeIntervalSeconds(value) {
+    const parsed = parseInt(value, 10);
+    if (!Number.isFinite(parsed)) {
+        return null;
+    }
+    return Math.max(MIN_INTERVAL_SECONDS, Math.min(MAX_INTERVAL_SECONDS, parsed));
+}
+
+function pruneInactiveWatchers(nowMs = Date.now()) {
+    for (const [clientWatcherId, watcher] of updateWatchers.entries()) {
+        if (!watcher || (nowMs - watcher.lastSeenMs) > KEEPALIVE_TIMEOUT_MS) {
+            updateWatchers.delete(clientWatcherId);
+        }
+    }
+}
+
+function getEffectiveIntervalMs() {
+    let fastestMs = null;
+    for (const watcher of updateWatchers.values()) {
+        const intervalMs = watcher.intervalSeconds * 1000;
+        if (fastestMs === null || intervalMs < fastestMs) {
+            fastestMs = intervalMs;
+        }
+    }
+    return fastestMs;
+}
+
+function sendManualUpdateCommands() {
+    pruneInactiveWatchers();
+    if (updateWatchers.size === 0) {
+        refreshManualCommandScheduler();
+        return;
+    }
+
+    if (!client.connected) {
+        console.warn('Manual MQTT update commands skipped because MQTT client is disconnected.');
+        return;
+    }
+
+    MANUAL_COMMANDS.forEach(({ topic, payload }) => {
+        client.publish(topic, payload, { qos: 0 }, (error) => {
+            if (error) {
+                console.error(`Failed to publish manual update command to ${topic}`, error);
+            }
+        });
+    });
+}
+
+function refreshManualCommandScheduler() {
+    pruneInactiveWatchers();
+    const nextEffectiveIntervalMs = getEffectiveIntervalMs();
+
+    if (!nextEffectiveIntervalMs) {
+        if (manualCommandIntervalHandle) {
+            clearInterval(manualCommandIntervalHandle);
+            manualCommandIntervalHandle = null;
+            currentEffectiveIntervalMs = null;
+            console.log('Manual MQTT update scheduler stopped (no active watchers).');
+        }
+        return;
+    }
+
+    if (manualCommandIntervalHandle && currentEffectiveIntervalMs === nextEffectiveIntervalMs) {
+        return;
+    }
+
+    if (manualCommandIntervalHandle) {
+        clearInterval(manualCommandIntervalHandle);
+    }
+
+    currentEffectiveIntervalMs = nextEffectiveIntervalMs;
+    manualCommandIntervalHandle = setInterval(sendManualUpdateCommands, currentEffectiveIntervalMs);
+    console.log(`Manual MQTT update scheduler set to ${Math.round(currentEffectiveIntervalMs / 1000)}s.`);
+}
+
+function registerManualUpdateWatcher(clientWatcherId, intervalSeconds) {
+    const safeClientWatcherId = (clientWatcherId || '').trim();
+    const safeIntervalSeconds = toSafeIntervalSeconds(intervalSeconds);
+
+    if (!safeClientWatcherId) {
+        throw new Error('clientId is required');
+    }
+    if (!safeIntervalSeconds) {
+        throw new Error('intervalSeconds must be a number');
+    }
+
+    updateWatchers.set(safeClientWatcherId, {
+        intervalSeconds: safeIntervalSeconds,
+        lastSeenMs: Date.now(),
+    });
+
+    refreshManualCommandScheduler();
+    sendManualUpdateCommands();
+
+    return getManualUpdateStatus();
+}
+
+function keepAliveManualUpdateWatcher(clientWatcherId) {
+    const safeClientWatcherId = (clientWatcherId || '').trim();
+    if (!safeClientWatcherId || !updateWatchers.has(safeClientWatcherId)) {
+        return false;
+    }
+
+    const watcher = updateWatchers.get(safeClientWatcherId);
+    watcher.lastSeenMs = Date.now();
+    refreshManualCommandScheduler();
+    return true;
+}
+
+function unregisterManualUpdateWatcher(clientWatcherId) {
+    const safeClientWatcherId = (clientWatcherId || '').trim();
+    if (!safeClientWatcherId) {
+        return false;
+    }
+
+    const deleted = updateWatchers.delete(safeClientWatcherId);
+    refreshManualCommandScheduler();
+    return deleted;
+}
+
+function getManualUpdateStatus() {
+    pruneInactiveWatchers();
+    const nowMs = Date.now();
+
+    const watchers = Array.from(updateWatchers.entries()).map(([clientWatcherId, watcher]) => ({
+        clientId: clientWatcherId,
+        intervalSeconds: watcher.intervalSeconds,
+        lastSeenSecondsAgo: Math.max(0, Math.round((nowMs - watcher.lastSeenMs) / 1000)),
+    }));
+
+    return {
+        activeWatcherCount: watchers.length,
+        effectiveIntervalSeconds: currentEffectiveIntervalMs ? Math.round(currentEffectiveIntervalMs / 1000) : null,
+        keepAliveTimeoutSeconds: KEEPALIVE_TIMEOUT_MS / 1000,
+        keepAliveRecommendedSeconds: KEEPALIVE_RECOMMENDED_SECONDS,
+        commands: MANUAL_COMMANDS,
+        watchers,
+    };
+}
+
+setInterval(() => {
+    pruneInactiveWatchers();
+    refreshManualCommandScheduler();
+}, 5000);
 
 const client = mqtt.connect(connectUrl, {
-  clientId,
-  clean: true,
-  connectTimeout: 4000,
-  username: username,
-  password: password,
-  reconnectPeriod: 1000,
-})
+    clientId,
+    clean: true,
+    connectTimeout: 4000,
+    username,
+    password,
+    reconnectPeriod: 1000,
+});
 
 client.on('connect', () => {
-  console.log('Connected, subscribing to topic "owntracks/#"');
+    console.log('Connected, subscribing to topic "owntracks/#"');
     client.subscribe('owntracks/#', { qos: 0 }, (error) => {
         if (error) {
-        console.error('Subscribe error:', error);
+            console.error('Subscribe error:', error);
         } else {
-        console.log('Subscribed successfully to topic "owntracks/#"');
+            console.log('Subscribed successfully to topic "owntracks/#"');
         }
     });
-})
+});
 
 client.on('message', (topic, payload) => {
-    console.log('Received Message:', topic, payload.toString())
+    console.log('Received Message:', topic, payload.toString());
 
-    //logging acc, lat, lon, alt, and batt values from payload
-    payload = JSON.parse(payload.toString());
-    // console.log("Acc: ", payload.acc);
-    // console.log("Lat: ", payload.lat);
-    // console.log("Lon: ", payload.lon);
-    // console.log("Alt: ", payload.alt);
-    // console.log("Batt: ", payload.batt);
-    // console.log("Vel: ", payload.vel);
-    // console.log("Course: ", payload.cog);
-    // console.log("Acceleration: ", payload.acc);
-    // console.log("Vertical Accuracy: ", payload.vac);
-    // console.log("Mode: ", payload.m);
-    // console.log("Time: ", payload.tst);
-    // console.log("Tracker ID: ", payload.tid);
+    try {
+        const parsedPayload = JSON.parse(payload.toString());
+        writeGpsDataToInflux({
+            time: parsedPayload.tst,
+            tid: parsedPayload.tid,
+            latitude: parsedPayload.lat,
+            longitude: parsedPayload.lon,
+            altitude: parsedPayload.alt,
+            gps_accuracy: parsedPayload.acc,
+            battery: parsedPayload.batt,
+            velocity: parsedPayload.vel,
+            course: parsedPayload.cog,
+            acceleration: parsedPayload.acc,
+            vertical_accuracy: parsedPayload.vac,
+            mode: parsedPayload.m,
+        });
+    } catch (err) {
+        console.error('Failed to parse MQTT payload:', err);
+    }
+});
 
-    writeGpsDataToInflux({
-        time: payload.tst,
-        tid: payload.tid,
-        latitude: payload.lat,
-        longitude: payload.lon,
-        altitude: payload.alt,
-        gps_accuracy: payload.acc,
-        battery: payload.batt,
-        velocity: payload.vel,
-        course: payload.cog,
-        acceleration: payload.acc,
-        vertical_accuracy: payload.vac,
-        mode: payload.m
-    });
-})
+module.exports = {
+    registerManualUpdateWatcher,
+    keepAliveManualUpdateWatcher,
+    unregisterManualUpdateWatcher,
+    getManualUpdateStatus,
+    sendManualUpdateCommands,
+};

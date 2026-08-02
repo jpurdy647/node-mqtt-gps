@@ -35,20 +35,54 @@ const pool = new Pool({
 
 class pointsDBConnector {
 
-  queryPointsHours(hours, tracker_id, errorCallback = null) {
-    console.log("Querying points for tracker_id:", tracker_id, "hours:", hours);
+  queryPointsHours(hours, tracker_ids, errorCallback = null) {
+    console.log("Querying points for tracker_ids:", tracker_ids, "hours:", hours);
     var now = new Date();
     var seconds_end = now.getTime() / 1000;
     var seconds_start = seconds_end - (hours * 60 * 60);
     console.log("Calculated seconds_start:", seconds_start, "seconds_end:", seconds_end);
-    var result = this.queryPoints(seconds_start, seconds_end, tracker_id, errorCallback);
+    var result = this.queryPoints(seconds_start, seconds_end, tracker_ids, errorCallback);
     console.log("Result from queryPoints:", result);
     return result;
   }
 
-  queryPoints(seconds_start, seconds_end, tracker_id, errorCallback = null) {
-    console.log("Querying points for tracker_id:", tracker_id, "seconds_start:", seconds_start, "seconds_end:", seconds_end);
-    console.log(`Query: \nSELECT * \nFROM gps_points \nWHERE time >= to_timestamp(${seconds_start}) AND time < to_timestamp(${seconds_end}) AND tracker_id = '${tracker_id}'\nORDER BY time DESC`);
+  async queryPoints(seconds_start, seconds_end, tracker_ids, errorCallback = null) {
+    console.log("Querying points for tracker_ids:", tracker_ids, "seconds_start:", seconds_start, "seconds_end:", seconds_end);
+    
+    if (tracker_ids[0] == "all_trackers") {
+      tracker_ids = await this.getDistinctTrackers(errorCallback);
+      console.log("Queried distinct trackers for 'all_trackers':", tracker_ids);
+    }
+
+    var queries = tracker_ids.map(tracker_id => {
+      return {
+        text: `
+        SELECT *
+        FROM gps_points 
+        WHERE 
+          time >= to_timestamp(${seconds_start})
+          AND
+          time < to_timestamp(${seconds_end})
+          AND
+          tracker_id = '${tracker_id}'
+        ORDER BY time DESC
+        `
+      }
+    });
+
+    console.log("Constructed queries for each tracker_id:", queries);
+    
+    const promiseArray = queries.map(query => pool.query(query));
+    const results = await Promise.all(promiseArray);
+
+    console.log("Results from all queries:", results);
+
+    //map results to objects with tracker_id and results array
+    return results.map((result, index) => ({
+      tracker_id: result.rows.length > 0 ? result.rows[0].tracker_id : tracker_ids[index], // Use tracker_id from result if available, otherwise use the one from input
+      results: result.rows
+    }));
+    
     return pool.query(
         `
         select *
@@ -58,7 +92,7 @@ class pointsDBConnector {
           and
           time < to_timestamp(${seconds_end})
           and
-          tracker_id = '${tracker_id}'
+          tracker_id IN (${tracker_ids.map(id => `'${id}'`).join(", ")})
         order by time desc
         `);
         /*
@@ -77,18 +111,26 @@ class pointsDBConnector {
     return this.queryPoints(
       Date.now() - (hours * 60 * 60 * 1000),
       Date.now(),
-      tracker_id
+      [tracker_id]
     );
   }
 
-  constructor(){}
+  constructor() {}
 
 
   getDistinctTrackers(errorCallback = null) {
     console.log("Querying distinct trackers from DB...");
-    return pool.query(`SELECT DISTINCT tracker_id FROM gps_points`);
+    return pool.query(`SELECT DISTINCT tracker_id FROM gps_points`).then((result) => {
+      console.log("Distinct trackers query result:", result);   
+      return result.rows.map(r => r.tracker_id); // Extract just the tracker_id values
+    }).catch((err) => {
+      console.error("Error querying distinct trackers:", err);
+      if (errorCallback) {
+        errorCallback(err);
+      }
+      return [];
+    });
   }
-
 }
 
 module.exports = pointsDBConnector;
