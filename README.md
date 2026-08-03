@@ -1,6 +1,6 @@
 # node-mqtt-web
 
-Web map viewer and backend for GPS tracker data, with MQTT-triggered location refresh support for OwnTracks devices.
+Web map viewer and backend for GPS tracker data, with MQTT-triggered location ingestion and manual OwnTracks refresh support.
 
 ## What this project does
 
@@ -8,8 +8,11 @@ Web map viewer and backend for GPS tracker data, with MQTT-triggered location re
 - Reads tracker points from PostgreSQL (`gps_points` table).
 - Subscribes to `owntracks/#` over MQTT and writes incoming points to PostgreSQL.
 - Supports client-driven manual MQTT refresh commands at selectable intervals.
+- Discovers and uses OwnTracks command endpoints dynamically when enabled.
 - Detects and visualizes stop segments with configurable thresholds.
 - Renders live SVG tracker markers with 2-character tracker IDs.
+
+> This implementation uses PostgreSQL as its persistence layer and does not rely on InfluxDB.
 
 ## Project structure
 
@@ -35,7 +38,13 @@ npm install
 
 ## Run
 
-Note: `package.json` currently points `start` to `main.ts`, but runtime entry is `main.js`.
+The runtime entry point is `main.js`.
+
+```bash
+npm start
+```
+
+Or run it directly:
 
 ```bash
 node main.js

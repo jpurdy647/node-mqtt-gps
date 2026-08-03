@@ -2,9 +2,9 @@
   "name": "node-tracker",
   "version": "0.0.0",
   "description": "",
-  "main": "main.ts",
+  "main": "main.js",
   "scripts": {
-    "start": "node main.ts"
+    "start": "node main.js"
   },
   "license": "MIT",
   "dependencies": {
