@@ -27,7 +27,6 @@ Web map viewer and backend for GPS tracker data, with MQTT-triggered location re
 - Reachable services:
   - MQTT broker
   - PostgreSQL
-  - InfluxDB
 
 ## Install
 
