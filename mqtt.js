@@ -1,6 +1,7 @@
 const mqtt = require('mqtt');
-const Influx = require('influx');
 require('dotenv').config();
+
+const pointsDBConnector = require('./db-points-psql');
 
 const protocol = process.env.MQTT_PROTOCOL || 'mqtt';
 const host = process.env.MQTT_HOST || '127.0.0.1';
@@ -16,35 +17,9 @@ const presetOwntracksCmdDefaultPayload =
 const clientId = `node_trackermqtt_${Math.random().toString(16).slice(3)}`;
 
 const connectUrl = `${protocol}://${host}:${port}`;
+const pointsDB = new pointsDBConnector();
 
-const JP_INFLUX_HOST = process.env.INFLUX_HOST || '127.0.0.1';
-const JP_INFLUX__PORT = process.env.INFLUX_PORT || '8086';
-const JP_INFLUX_DB = process.env.INFLUX_DB || 'ha';
-
-const influx = new Influx.InfluxDB({
-    host: JP_INFLUX_HOST,
-    port: JP_INFLUX__PORT,
-    database: JP_INFLUX_DB,
-    schema: [
-        {
-            measurement: 'gps_data',
-            fields: {
-                latitude: Influx.FieldType.FLOAT,
-                longitude: Influx.FieldType.FLOAT,
-                altitude: Influx.FieldType.FLOAT,
-                gps_accuracy: Influx.FieldType.FLOAT,
-                battery: Influx.FieldType.FLOAT,
-                velocity: Influx.FieldType.FLOAT,
-                course: Influx.FieldType.FLOAT,
-                acceleration: Influx.FieldType.FLOAT,
-                vertical_accuracy: Influx.FieldType.FLOAT,
-            },
-            tags: ['round_lat', 'round_lon', 'tracker_id', 'mode'],
-        },
-    ],
-});
-
-function writeGpsDataToInflux(gpsData) {
+function writeGpsDataToPostgres(gpsData) {
     const {
         time,
         tid,
@@ -57,36 +32,27 @@ function writeGpsDataToInflux(gpsData) {
         course,
         acceleration,
         vertical_accuracy,
-        mode,
     } = gpsData;
 
     const round_lat = Math.round(latitude * 100) / 100;
     const round_lon = Math.round(longitude * 100) / 100;
 
-    influx.writePoints([
-        {
-            measurement: 'gps_data',
-            tags: {
-                tracker_id: tid.toString(),
-                round_lat: round_lat.toString(),
-                round_lon: round_lon.toString(),
-                mode: mode.toString(),
-            },
-            fields: {
-                altitude,
-                latitude,
-                longitude,
-                gps_accuracy,
-                battery,
-                velocity,
-                course,
-                acceleration,
-                vertical_accuracy,
-            },
-            time: new Date(time * 1000).getMilliseconds() * 1000,
-        },
-    ]).catch((error) => {
-        console.error('Error writing GPS data to InfluxDB:', error);
+    pointsDB.writePoint({
+        time,
+        tracker_id: tid.toString(),
+        latitude,
+        longitude,
+        round_lat,
+        round_lon,
+        gps_accuracy,
+        battery,
+        altitude,
+        vertical_accuracy,
+        velocity,
+        course,
+        acceleration,
+    }).catch((error) => {
+        console.error('Error writing GPS data to PostgreSQL:', error);
     });
 }
 
@@ -364,7 +330,7 @@ client.on('message', (topic, payload) => {
 
     try {
         const parsedPayload = JSON.parse(payload.toString());
-        writeGpsDataToInflux({
+        writeGpsDataToPostgres({
             time: parsedPayload.tst,
             tid: parsedPayload.tid,
             latitude: parsedPayload.lat,
@@ -376,7 +342,6 @@ client.on('message', (topic, payload) => {
             course: parsedPayload.cog,
             acceleration: parsedPayload.acc,
             vertical_accuracy: parsedPayload.vac,
-            mode: parsedPayload.m,
         });
     } catch (err) {
         console.error('Failed to parse MQTT payload:', err);

@@ -1,9 +1,5 @@
 /**
- * In this example we'll create a server which has an index page that prints
- * out "hello world", and a page `http://localhost:3000/times` which prints
- * out the last ten response times that InfluxDB gave us.
- *
- * Get started by importing everything we need!
+ * Lightweight Express server for the tracker map UI and data APIs.
  */
 const express = require("express");
 const { check, query } = require('express-validator');

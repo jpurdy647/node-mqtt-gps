@@ -6,7 +6,7 @@ Web map viewer and backend for GPS tracker data, with MQTT-triggered location re
 
 - Serves an interactive map UI for tracker history and stop/travel segmentation.
 - Reads tracker points from PostgreSQL (`gps_points` table).
-- Subscribes to `owntracks/#` over MQTT and writes incoming points to InfluxDB.
+- Subscribes to `owntracks/#` over MQTT and writes incoming points to PostgreSQL.
 - Supports client-driven manual MQTT refresh commands at selectable intervals.
 - Detects and visualizes stop segments with configurable thresholds.
 - Renders live SVG tracker markers with 2-character tracker IDs.
@@ -14,9 +14,8 @@ Web map viewer and backend for GPS tracker data, with MQTT-triggered location re
 ## Project structure
 
 - `main.js` - Express server, map routes, points APIs, manual-update APIs.
-- `mqtt.js` - MQTT subscriber + Influx writer + manual command scheduler/discovery.
+- `mqtt.js` - MQTT subscriber + PostgreSQL writer + manual command scheduler/discovery.
 - `db-points-psql.js` - PostgreSQL query layer used by map APIs.
-- `db-points-influx.js` - Influx query helper.
 - `views/map-view.ejs` - Main map UI and interaction logic.
 - `assets/` - Static web assets.
 
@@ -27,7 +26,6 @@ Web map viewer and backend for GPS tracker data, with MQTT-triggered location re
 - Reachable services:
   - MQTT broker
   - PostgreSQL
-  - InfluxDB
 
 ## Install
 
@@ -78,9 +76,6 @@ cp .env.example .env
 - `PSQL_DB`
 - `PSQL_USER`
 - `PSQL_PASS`
-- `INFLUX_HOST`
-- `INFLUX_PORT`
-- `INFLUX_DB`
 
 ## HTTP endpoints
 

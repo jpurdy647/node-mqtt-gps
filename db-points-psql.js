@@ -114,6 +114,55 @@ class pointsDBConnector {
 
   constructor() {}
 
+  async writePoint(pointData) {
+    const data = {
+      time: pointData.time,
+      tracker_id: pointData.tracker_id,
+      latitude: pointData.latitude,
+      longitude: pointData.longitude,
+      round_lat: pointData.round_lat,
+      round_lon: pointData.round_lon,
+      gps_accuracy: pointData.gps_accuracy,
+      battery: pointData.battery,
+      altitude: pointData.altitude,
+      vertical_accuracy: pointData.vertical_accuracy,
+      velocity: pointData.velocity,
+      course: pointData.course,
+      acceleration: pointData.acceleration,
+    };
+
+    const columns = [];
+    const values = [];
+    const placeholders = [];
+    let paramIndex = 1;
+
+    Object.entries(data).forEach(([key, value]) => {
+      if (value === null || value === undefined) {
+        return;
+      }
+
+      columns.push(key);
+      if (key === 'time') {
+        values.push(value);
+        placeholders.push(`to_timestamp($${paramIndex++})`);
+      } else {
+        values.push(value);
+        placeholders.push(`$${paramIndex++}`);
+      }
+    });
+
+    if (columns.length === 0) {
+      return null;
+    }
+
+    const queryText = `
+      INSERT INTO gps_points (${columns.join(', ')})
+      VALUES (${placeholders.join(', ')})
+      RETURNING *
+    `;
+
+    return pool.query(queryText, values);
+  }
 
   getDistinctTrackers(errorCallback = null) {
     console.log("Querying distinct trackers from DB...");
