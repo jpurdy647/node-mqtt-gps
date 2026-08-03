@@ -43,6 +43,7 @@
         var trackers = [];// ;
         var allTrackers = [];
         var trackerColors = {};
+        var disabledTrackers = {};
         var trackerColorPalette = ['#3388ff', '#ff3b30', '#34a853', '#8e44ad', '#f39c12', '#1abc9c', '#e67e22', '#2c3e50'];
         var DTP;
         var map;
@@ -58,6 +59,7 @@
         var segmentNavigationMode = 'travel';
         var manualUpdatesClientId = null;
         var manualUpdatesKeepAliveTimer = null;
+        var manualUpdatesFollowTimer = null;
         var manualUpdatesKeepAliveSeconds = 20;
         var stopDetectionRadiusMeters = 125;
         var stopDetectionMinPoints = 4;
@@ -85,6 +87,13 @@
                 trackerColors[trackerId] = trackerColorPalette[paletteIndex % trackerColorPalette.length] || '#3388ff';
             }
             return trackerColors[trackerId];
+        }
+
+        function isTrackerEnabled(trackerId) {
+            if (!trackerId) {
+                return true;
+            }
+            return !Boolean(disabledTrackers && disabledTrackers[trackerId]);
         }
 
         function getTrackerShortId(trackerId) {
@@ -193,7 +202,7 @@
                     ? samplePointsByTime(sourcePoints, getStopDetectionSampleIntervalSeconds())
                     : sourcePoints;
                 const pointMap = new Map(finalPoints.map((point) => [point.puid, point]));
-                if (trackerId) {
+                if (trackerId && isTrackerEnabled(trackerId)) {
                     parsedPoints.set(trackerId, pointMap);
                 }
             });
@@ -238,6 +247,7 @@
                     segmentNavigationMode: document.getElementById('segmentNavigationModeSelect').value,
                     showIndividualPoints,
                     trackerColors,
+                    disabledTrackers,
                 };
 
                 const payload = JSON.stringify(settings);
@@ -292,6 +302,7 @@
             if (settings.trackerColors) {
                 trackerColors = { ...settings.trackerColors };
             }
+            disabledTrackers = settings.disabledTrackers ? { ...settings.disabledTrackers } : {};
             const trackerSelect = document.getElementById('selTrackers');
             if (trackerSelect && settings.trackerId !== undefined) {
                 const requestedTracker = settings.trackerId || 'all_trackers';
@@ -356,7 +367,8 @@
         function clearSegmentHighlight() {
             segmentLayers.forEach((layer) => {
                 if (layer && layer.setStyle) {
-                    layer.setStyle({ color: '#3388ff', weight: 2, opacity: 0.7 });
+                    const baseStyle = layer._jpBaseStyle || { color: '#3388ff', weight: 2, opacity: 0.8 };
+                    layer.setStyle(baseStyle);
                 }
             });
 
@@ -436,7 +448,74 @@
             }
         }
 
-        function highlightSegment(segmentId) {
+        function getCurrentSelectedSegmentContext() {
+            if (!selectedSegmentId || !Array.isArray(detectedSegments) || !detectedSegments.length) {
+                return null;
+            }
+
+            const segment = detectedSegments.find((entry) => entry.id === selectedSegmentId);
+            if (!segment) {
+                return null;
+            }
+
+            return {
+                id: segment.id,
+                trackerId: segment.trackerId || null,
+                type: segment.type || null,
+                startTime: Number.isFinite(segment.startTime) ? segment.startTime : null,
+                endTime: Number.isFinite(segment.endTime) ? segment.endTime : null,
+            };
+        }
+
+        function findBestSegmentMatch(context) {
+            if (!context || !Array.isArray(detectedSegments) || !detectedSegments.length) {
+                return null;
+            }
+
+            const exactById = detectedSegments.find((segment) => segment.id === context.id);
+            if (exactById) {
+                return exactById;
+            }
+
+            const candidates = detectedSegments.filter((segment) => {
+                if (context.type && segment.type !== context.type) {
+                    return false;
+                }
+                if (context.trackerId && segment.trackerId !== context.trackerId) {
+                    return false;
+                }
+                return Number.isFinite(segment.startTime) && Number.isFinite(segment.endTime);
+            });
+
+            if (!candidates.length) {
+                return null;
+            }
+
+            if (!Number.isFinite(context.startTime) && !Number.isFinite(context.endTime)) {
+                return candidates[0];
+            }
+
+            let bestSegment = null;
+            let bestScore = Number.POSITIVE_INFINITY;
+            candidates.forEach((segment) => {
+                const startDelta = Number.isFinite(context.startTime)
+                    ? Math.abs(segment.startTime - context.startTime)
+                    : 0;
+                const endDelta = Number.isFinite(context.endTime)
+                    ? Math.abs(segment.endTime - context.endTime)
+                    : 0;
+                const score = startDelta + endDelta;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestSegment = segment;
+                }
+            });
+
+            return bestSegment;
+        }
+
+        function highlightSegment(segmentId, options = {}) {
+            const focusMap = options.focusMap !== false;
             clearSegmentHighlight();
             const segment = detectedSegments.find((entry) => entry.id === segmentId);
             if (!segment) {
@@ -446,7 +525,7 @@
             selectedSegmentId = segmentId;
             if (segment.polyline) {
                 segment.polyline.setStyle({ color: '#ff3b30', weight: 5, opacity: 1 });
-                if (segment.polyline.getBounds) {
+                if (focusMap && segment.polyline.getBounds) {
                     fitBoundsVisible(segment.polyline.getBounds());
                 }
             }
@@ -479,12 +558,12 @@
                     });
                 }
 
-                if (segment.stopRadiusCircle && segment.stopRadiusCircle.getBounds && map) {
+                if (focusMap && segment.stopRadiusCircle && segment.stopRadiusCircle.getBounds && map) {
                     fitBoundsVisible(segment.stopRadiusCircle.getBounds(), {
                         paddingTopLeft: [50, 50],
                         paddingBottomRight: [50, 50 + getDrawerOcclusionHeight()],
                     });
-                } else if (segment.center && map && map.setView) {
+                } else if (focusMap && segment.center && map && map.setView) {
                     setViewVisible([segment.center.latitude, segment.center.longitude], Math.max(map.getZoom(), 16));
                 }
 
@@ -510,6 +589,25 @@
                 });
             }
             renderSegmentList();
+        }
+
+        function restoreSelectedSegmentAfterRefresh(previousSegmentContext, preserveViewport) {
+            if (!previousSegmentContext) {
+                selectedSegmentId = null;
+                highlightedSegment = null;
+                renderSegmentList();
+                return;
+            }
+
+            const matchedSegment = findBestSegmentMatch(previousSegmentContext);
+            if (!matchedSegment) {
+                selectedSegmentId = null;
+                highlightedSegment = null;
+                renderSegmentList();
+                return;
+            }
+
+            highlightSegment(matchedSegment.id, { focusMap: !preserveViewport });
         }
 
         function updateSegmentNavigator() {
@@ -636,7 +734,9 @@
             updateSegmentNavigator();
         }
 
-        function showPoints(){
+        function showPoints(options = {}){
+            const preserveViewport = Boolean(options && options.preserveViewport);
+            const previousSelectedSegmentContext = getCurrentSelectedSegmentContext();
             linesGroup.clearLayers(); // Clear existing lines from the map
             transitionGroup.clearLayers(); // Clear existing transition markers from the map
             renderedPointMarkersById = new Map();
@@ -645,7 +745,7 @@
             clearSegmentHighlight();
 
             if (points.size === 0) {
-                renderSegmentList();
+                restoreSelectedSegmentAfterRefresh(previousSelectedSegmentContext, preserveViewport);
                 return; // No points to display
             }
 
@@ -704,8 +804,9 @@
                 var polyline = null;
                 if (trackerLinePoints.length >= 2) {
                     polyline = L.polyline(trackerLinePoints.map((p) => [p.latitude, p.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
+                    polyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
                     segmentLayers.push(polyline);
-                    if (polyline.getBounds) {
+                    if (!preserveViewport && polyline.getBounds) {
                         fitBoundsVisible(polyline.getBounds(), {
                             paddingTopLeft: [20, 20],
                             paddingBottomRight: [20, 20 + getDrawerOcclusionHeight()],
@@ -763,7 +864,7 @@
 
             refreshLiveMarkers();
 
-            renderSegmentList();
+            restoreSelectedSegmentAfterRefresh(previousSelectedSegmentContext, preserveViewport);
         }
 
         function loadPopupContentforPoint(pointPIUD) {
@@ -792,7 +893,7 @@
 
         }
 
-        function loadTrackersAndPoints() {
+        function loadTrackersAndPoints(options = {}) {
             saveSettings();
             const xhttp = new XMLHttpRequest();
             xhttp.onload = function() {
@@ -803,11 +904,11 @@
                     if (Array.isArray(response.tracker_ids)) {
                         processTrackers(response.tracker_ids);
                     }
-                    showPoints();
+                    showPoints(options);
                 } catch (err) {
                     console.error("Failed to load points", err);
                     points = new Map();
-                    showPoints();
+                    showPoints(options);
                 }
             }
             // Get the selected tracker ID from the query or the dropdown
@@ -968,6 +1069,7 @@
                     const trackerColor = getTrackerColor(trackerId);
                     if (type === Mode.MOVING) {
                         polyline = L.polyline(points.map((point) => [point.latitude, point.longitude]), { color: trackerColor, weight: 2, opacity: 0.8 }).addTo(linesGroup);
+                        polyline._jpBaseStyle = { color: trackerColor, weight: 2, opacity: 0.8 };
                         segmentLayers.push(polyline);
                     } else {
                         const marker = L.marker([center.latitude, center.longitude], { icon: L.divIcon({ html: `<div style="background:${trackerColor};width:10px;height:10px;border-radius:50%;"></div>`, iconSize: [10, 10], iconAnchor: [5, 5] }) }).bindPopup(`Stop ${new Date(segmentStartTime || startTime).toLocaleString()}`).addTo(transitionGroup);
@@ -1205,6 +1307,7 @@
             }
             if (!trackers.length) {
                 container.innerHTML = "<div style='font-size: 12px; color: #666;'>No trackers loaded yet.</div>";
+                renderTrackerLegend();
                 return;
             }
 
@@ -1215,6 +1318,76 @@
                     <input type='color' value='${color}' data-tracker-id='${trackerId}' onchange='updateTrackerColor(this.getAttribute("data-tracker-id"), this.value); saveSettings(); refreshPoints();' />
                 </label>`;
             }).join('');
+
+            renderTrackerLegend();
+        }
+
+        function renderTrackerLegend() {
+            const container = document.getElementById('trackerLegendBody');
+            if (!container) {
+                return;
+            }
+
+            const trackerRows = trackers.length
+                ? trackers.map((trackerId) => {
+                    const color = getTrackerColor(trackerId);
+                    const disabledClass = isTrackerEnabled(trackerId) ? '' : ' disabled';
+                    const toggleVerb = isTrackerEnabled(trackerId) ? 'Disable' : 'Enable';
+                    return `<button type='button' class='tracker-legend-row tracker-legend-toggle-row${disabledClass}' onclick='toggleTrackerLegendItem("${encodeURIComponent(trackerId)}")' title='${toggleVerb} ${trackerId}'>
+                        <span class='tracker-legend-line' style='background:${color};'></span>
+                        <span class='tracker-legend-label'>${trackerId}</span>
+                    </button>`;
+                }).join('')
+                : "<div class='tracker-legend-empty'>No trackers loaded yet.</div>";
+
+            container.innerHTML = `
+                <div class='tracker-legend-section'>
+                    <div class='tracker-legend-title'>Tracker Lines</div>
+                    <div class='tracker-legend-list'>${trackerRows}</div>
+                </div>
+                <div class='tracker-legend-section'>
+                    <div class='tracker-legend-title'>Stops</div>
+                    <div class='tracker-legend-row'>
+                        <span class='tracker-legend-stop-circle'>
+                            <span class='tracker-legend-stop-center'></span>
+                        </span>
+                        <span class='tracker-legend-label'>Stop circle + center</span>
+                    </div>
+                    <div class='tracker-legend-row'>
+                        <span class='tracker-legend-stop-point'></span>
+                        <span class='tracker-legend-label'>Stop point</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        function toggleTrackerLegend() {
+            const legend = document.getElementById('trackerLegend');
+            const button = document.getElementById('trackerLegendToggle');
+            if (!legend || !button) {
+                return;
+            }
+
+            const collapsed = legend.classList.toggle('collapsed');
+            button.textContent = collapsed ? 'Show' : 'Hide';
+            button.setAttribute('aria-expanded', String(!collapsed));
+        }
+
+        function toggleTrackerLegendItem(encodedTrackerId) {
+            const trackerId = decodeURIComponent(encodedTrackerId || '');
+            if (!trackerId) {
+                return;
+            }
+
+            if (isTrackerEnabled(trackerId)) {
+                disabledTrackers[trackerId] = true;
+            } else {
+                delete disabledTrackers[trackerId];
+            }
+
+            saveSettings();
+            renderTrackerLegend();
+            refreshPoints();
         }
 
         function updateTrackerColor(trackerId, color) {
@@ -1223,6 +1396,7 @@
             }
             trackerColors[trackerId] = color;
             saveSettings();
+            renderTrackerLegend();
         }
 
         function processTrackers(trackersList) {
@@ -1518,6 +1692,13 @@
             }
         }
 
+        function stopManualUpdatesFollow() {
+            if (manualUpdatesFollowTimer) {
+                clearInterval(manualUpdatesFollowTimer);
+                manualUpdatesFollowTimer = null;
+            }
+        }
+
         function sendManualUpdatesKeepAlive() {
             const clientId = getOrCreateManualUpdatesClientId();
             postJson('/api/mqtt/manual-updates/keepalive', { clientId }).catch((err) => {
@@ -1529,6 +1710,21 @@
             stopManualUpdatesKeepAlive();
             sendManualUpdatesKeepAlive();
             manualUpdatesKeepAliveTimer = setInterval(sendManualUpdatesKeepAlive, manualUpdatesKeepAliveSeconds * 1000);
+        }
+
+        function startManualUpdatesFollow(intervalSeconds) {
+            stopManualUpdatesFollow();
+            const safeIntervalSeconds = Math.max(5, parseInt(intervalSeconds, 10) || 0);
+            if (!safeIntervalSeconds) {
+                return;
+            }
+
+            manualUpdatesFollowTimer = setInterval(() => {
+                if (!map || !linesGroup || !transitionGroup) {
+                    return;
+                }
+                loadTrackersAndPoints({ preserveViewport: true });
+            }, safeIntervalSeconds * 1000);
         }
 
         function getManualMqttIntervalSeconds() {
@@ -1545,6 +1741,7 @@
                 postJson('/api/mqtt/manual-updates/watch', { clientId, intervalSeconds })
                     .then(() => {
                         startManualUpdatesKeepAlive();
+                        startManualUpdatesFollow(intervalSeconds);
                     })
                     .catch((err) => {
                         console.warn('Unable to register manual MQTT updates watcher', err);
@@ -1553,6 +1750,7 @@
             }
 
             stopManualUpdatesKeepAlive();
+            stopManualUpdatesFollow();
             postJson('/api/mqtt/manual-updates/unwatch', { clientId }).catch((err) => {
                 console.warn('Unable to unregister manual MQTT updates watcher', err);
             });
@@ -1561,6 +1759,7 @@
         window.addEventListener('beforeunload', function() {
             const clientId = getOrCreateManualUpdatesClientId();
             stopManualUpdatesKeepAlive();
+            stopManualUpdatesFollow();
 
             if (navigator.sendBeacon) {
                 const payload = new Blob([JSON.stringify({ clientId })], { type: 'application/json' });
@@ -1853,6 +2052,147 @@
             box-shadow: 0 4px 10px rgba(0,0,0,0.16);
             cursor: pointer;
         }
+        .tracker-legend {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            z-index: 20;
+            width: min(320px, calc(100vw - 24px));
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.96);
+            border: 1px solid rgba(15, 23, 42, 0.1);
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.18);
+            backdrop-filter: blur(3px);
+            overflow: hidden;
+        }
+        .tracker-legend-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 9px 10px;
+            background: linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.94));
+            border-bottom: 1px solid rgba(148, 163, 184, 0.28);
+        }
+        .tracker-legend-header span {
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            color: #0f172a;
+        }
+        .tracker-legend-toggle {
+            border: 1px solid #d0d7de;
+            border-radius: 999px;
+            background: #fff;
+            color: #334155;
+            font-size: 11px;
+            font-weight: 600;
+            min-height: 24px;
+            padding: 0 10px;
+            cursor: pointer;
+        }
+        .tracker-legend-body {
+            max-height: 280px;
+            overflow: auto;
+            padding: 9px 10px 10px;
+        }
+        .tracker-legend.collapsed .tracker-legend-body {
+            display: none;
+        }
+        .tracker-legend-section {
+            margin-bottom: 10px;
+        }
+        .tracker-legend-section:last-child {
+            margin-bottom: 0;
+        }
+        .tracker-legend-title {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            color: #475569;
+            margin-bottom: 6px;
+        }
+        .tracker-legend-list {
+            display: grid;
+            gap: 4px;
+        }
+        .tracker-legend-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 20px;
+        }
+        .tracker-legend-toggle-row {
+            width: 100%;
+            border: 1px solid transparent;
+            border-radius: 8px;
+            background: transparent;
+            padding: 3px 4px;
+            cursor: pointer;
+            text-align: left;
+        }
+        .tracker-legend-toggle-row:hover {
+            background: rgba(148, 163, 184, 0.14);
+            border-color: rgba(148, 163, 184, 0.3);
+        }
+        .tracker-legend-toggle-row.disabled {
+            background: rgba(148, 163, 184, 0.16);
+            border-color: rgba(148, 163, 184, 0.34);
+        }
+        .tracker-legend-toggle-row.disabled .tracker-legend-line {
+            background: #94a3b8 !important;
+        }
+        .tracker-legend-toggle-row.disabled .tracker-legend-label {
+            color: #64748b;
+        }
+        .tracker-legend-line {
+            display: inline-block;
+            width: 24px;
+            height: 4px;
+            border-radius: 999px;
+            flex: 0 0 auto;
+        }
+        .tracker-legend-label {
+            font-size: 12px;
+            color: #1e293b;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .tracker-legend-stop-circle {
+            position: relative;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            border: 1.5px dashed rgba(0, 0, 0, 0.45);
+            background: rgba(90, 90, 90, 0.2);
+            display: inline-block;
+            flex: 0 0 auto;
+        }
+        .tracker-legend-stop-center {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: rgba(100, 100, 100, 0.5);
+            border: 1px solid rgba(75, 75, 75, 0.6);
+        }
+        .tracker-legend-stop-point {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: rgba(0, 0, 0, 0.5);
+            display: inline-block;
+            flex: 0 0 auto;
+        }
+        .tracker-legend-empty {
+            font-size: 12px;
+            color: #64748b;
+        }
         .settings-overlay {
             position: fixed;
             inset: 0;
@@ -2012,6 +2352,11 @@
                 right: 8px;
                 padding: 8px 12px;
             }
+            .tracker-legend {
+                top: 8px;
+                left: 8px;
+                width: min(300px, calc(100vw - 16px));
+            }
             .settings-card {
                 padding: 12px;
             }
@@ -2030,6 +2375,13 @@
 <BODY>
     <div id="mapShell">
         <div id="theMap"></div>
+        <div id="trackerLegend" class="tracker-legend">
+            <div class="tracker-legend-header">
+                <span>Map Legend</span>
+                <button type="button" id="trackerLegendToggle" class="tracker-legend-toggle" onclick="toggleTrackerLegend()" aria-expanded="true">Hide</button>
+            </div>
+            <div id="trackerLegendBody" class="tracker-legend-body"></div>
+        </div>
         <button type="button" id="settingsToggleBtn" onclick="toggleSettingsOverlay()">⚙ Settings</button>
 
         <div id="settingsOverlay" class="settings-overlay" onclick="closeSettingsOverlay()">
@@ -2063,10 +2415,11 @@
                         <select id="manualMqttIntervalSelect" oninput="saveSettings(); updateManualUpdateWatcherFromUi()">
                             <option value="0">Off</option>
                             <option value="10">Every 10s</option>
-                            <option value="15">Every 15s</option>
-                            <option value="20">Every 20s</option>
                             <option value="30">Every 30s</option>
                             <option value="60">Every 60s</option>
+                            <option value="120">Every 2m</option>
+                            <option value="300">Every 5m</option>
+                            <option value="600">Every 10m</option>
                         </select>
                     </label>
                     <label for="stopDetectionRadiusInput">Stop Radius (m)

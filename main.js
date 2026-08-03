@@ -117,26 +117,54 @@ app.get("/trackers", function (req, res) {
   });
 });
 
-app.post("/api/mqtt/manual-updates/watch", function (req, res) {
+function handleManualUpdatesWatch(clientId, intervalSeconds, res) {
   try {
-    const { clientId, intervalSeconds } = req.body || {};
     const status = mqttManualUpdates.registerManualUpdateWatcher(clientId, intervalSeconds);
     res.json({ ok: true, status });
   } catch (err) {
     res.status(400).json({ ok: false, error: err.message });
   }
+}
+
+app.post("/api/mqtt/manual-updates/watch", function (req, res) {
+  const { clientId, intervalSeconds } = req.body || {};
+  handleManualUpdatesWatch(clientId, intervalSeconds, res);
 });
+
+app.get("/api/mqtt/manual-updates/watch", function (req, res) {
+  const clientId = req.query.clientId;
+  const intervalSeconds = req.query.intervalSeconds;
+  handleManualUpdatesWatch(clientId, intervalSeconds, res);
+});
+
+function handleManualUpdatesKeepAlive(clientId, res) {
+  const active = mqttManualUpdates.keepAliveManualUpdateWatcher(clientId);
+  res.json({ ok: true, active, status: mqttManualUpdates.getManualUpdateStatus() });
+}
 
 app.post("/api/mqtt/manual-updates/keepalive", function (req, res) {
   const { clientId } = req.body || {};
-  const active = mqttManualUpdates.keepAliveManualUpdateWatcher(clientId);
-  res.json({ ok: true, active, status: mqttManualUpdates.getManualUpdateStatus() });
+  handleManualUpdatesKeepAlive(clientId, res);
 });
+
+app.get("/api/mqtt/manual-updates/keepalive", function (req, res) {
+  const clientId = req.query.clientId;
+  handleManualUpdatesKeepAlive(clientId, res);
+});
+
+function handleManualUpdatesUnwatch(clientId, res) {
+  const removed = mqttManualUpdates.unregisterManualUpdateWatcher(clientId);
+  res.json({ ok: true, removed, status: mqttManualUpdates.getManualUpdateStatus() });
+}
 
 app.post("/api/mqtt/manual-updates/unwatch", function (req, res) {
   const { clientId } = req.body || {};
-  const removed = mqttManualUpdates.unregisterManualUpdateWatcher(clientId);
-  res.json({ ok: true, removed, status: mqttManualUpdates.getManualUpdateStatus() });
+  handleManualUpdatesUnwatch(clientId, res);
+});
+
+app.get("/api/mqtt/manual-updates/unwatch", function (req, res) {
+  const clientId = req.query.clientId;
+  handleManualUpdatesUnwatch(clientId, res);
 });
 
 app.get("/api/mqtt/manual-updates/status", function (req, res) {

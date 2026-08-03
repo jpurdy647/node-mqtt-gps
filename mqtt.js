@@ -7,6 +7,12 @@ const host = process.env.MQTT_HOST || '127.0.0.1';
 const port = process.env.MQTT_PORT || '1883';
 const username = process.env.MQTT_USERNAME;
 const password = process.env.MQTT_PASSWORD;
+const owntracksBaseTopic = (process.env.OWNTRACKS_BASE_TOPIC || 'owntracks').trim();
+const discoverCmdEndpoints = (process.env.MQTT_DISCOVER_CMD_ENDPOINTS || 'true').trim().toLowerCase() !== 'false';
+const presetOwntracksCmdDefaultPayload =
+    process.env.OWNTRACKS_CMD_DEFAULT_PAYLOAD ||
+    process.env.MQTT_MANUAL_COMMAND_DEFAULT_PAYLOAD ||
+    '{"_type":"cmd","action":"reportLocation"}';
 const clientId = `node_trackermqtt_${Math.random().toString(16).slice(3)}`;
 
 const connectUrl = `${protocol}://${host}:${port}`;
@@ -84,12 +90,87 @@ function writeGpsDataToInflux(gpsData) {
     });
 }
 
-const MANUAL_COMMANDS = [
-    { topic: 'owntracks/alana/alanaphone/cmd', payload: '{"_type":"cmd","action":"reportLocation"}' },
-    { topic: 'owntracks/josh/JPGraphene/cmd', payload: '{"_type":"cmd","action":"reportLocation"}' },
-    { topic: 'owntracks/lane/NLPGraphene/cmd', payload: '{"_type":"cmd","action":"reportLocation"}' },
-    { topic: 'owntracks/lisa/llp/cmd', payload: '{"_type":"cmd","action":"reportLocation"}' },
-];
+const DEFAULT_PRESET_OWNTRACKS_CMD_ENDPOINTS = [];
+
+function loadPresetOwntracksCmdEndpointsFromEnv() {
+    const raw = process.env.OWNTRACKS_PRESET_CMD_ENDPOINTS || process.env.MQTT_MANUAL_COMMANDS;
+    if (!raw || !raw.trim()) {
+        return DEFAULT_PRESET_OWNTRACKS_CMD_ENDPOINTS;
+    }
+
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+            throw new Error('OWNTRACKS_PRESET_CMD_ENDPOINTS must be a non-empty JSON array');
+        }
+
+        const normalized = parsed
+            .map((entry) => ({
+                topic: entry && typeof entry.topic === 'string' ? entry.topic.trim() : '',
+                payload: entry && typeof entry.payload === 'string' ? entry.payload : '',
+            }))
+            .filter((entry) => entry.topic && entry.payload);
+
+        if (normalized.length === 0) {
+            throw new Error('OWNTRACKS_PRESET_CMD_ENDPOINTS contains no valid topic/payload pairs');
+        }
+
+        return normalized;
+    } catch (err) {
+        console.warn('Invalid OWNTRACKS_PRESET_CMD_ENDPOINTS value, using default preset endpoints.', err.message);
+        return DEFAULT_PRESET_OWNTRACKS_CMD_ENDPOINTS;
+    }
+}
+
+const presetOwntracksCmdEndpoints = loadPresetOwntracksCmdEndpointsFromEnv();
+const discoveredCmdEndpointsByTopic = new Map();
+
+function getPresetOwntracksCmdEndpointsMap() {
+    const configured = new Map();
+    presetOwntracksCmdEndpoints.forEach((entry) => {
+        if (entry && entry.topic && entry.payload) {
+            configured.set(entry.topic, entry.payload);
+        }
+    });
+    return configured;
+}
+
+function discoverCmdEndpointFromTopic(topic) {
+    if (!discoverCmdEndpoints || !topic) {
+        return;
+    }
+
+    const parts = String(topic).split('/');
+    if (parts.length < 3 || parts[0] !== owntracksBaseTopic) {
+        return;
+    }
+
+    const user = (parts[1] || '').trim();
+    const device = (parts[2] || '').trim();
+    if (!user || !device) {
+        return;
+    }
+
+    const cmdTopic = `${owntracksBaseTopic}/${user}/${device}/cmd`;
+    discoveredCmdEndpointsByTopic.set(cmdTopic, {
+        sourceTopic: topic,
+        lastSeenMs: Date.now(),
+    });
+}
+
+function getEffectiveOwntracksCmdEndpoints() {
+    const configured = getPresetOwntracksCmdEndpointsMap();
+
+    if (discoverCmdEndpoints) {
+        for (const cmdTopic of discoveredCmdEndpointsByTopic.keys()) {
+            if (!configured.has(cmdTopic)) {
+                configured.set(cmdTopic, presetOwntracksCmdDefaultPayload);
+            }
+        }
+    }
+
+    return Array.from(configured.entries()).map(([topic, payload]) => ({ topic, payload }));
+}
 
 const KEEPALIVE_TIMEOUT_MS = 30 * 1000;
 const KEEPALIVE_RECOMMENDED_SECONDS = 20;
@@ -139,7 +220,13 @@ function sendManualUpdateCommands() {
         return;
     }
 
-    MANUAL_COMMANDS.forEach(({ topic, payload }) => {
+    const effectiveCommands = getEffectiveOwntracksCmdEndpoints();
+    if (!effectiveCommands.length) {
+        console.warn('No manual MQTT command endpoints are configured or discovered yet.');
+        return;
+    }
+
+    effectiveCommands.forEach(({ topic, payload }) => {
         client.publish(topic, payload, { qos: 0 }, (error) => {
             if (error) {
                 console.error(`Failed to publish manual update command to ${topic}`, error);
@@ -230,12 +317,18 @@ function getManualUpdateStatus() {
         lastSeenSecondsAgo: Math.max(0, Math.round((nowMs - watcher.lastSeenMs) / 1000)),
     }));
 
+    const effectiveCommands = getEffectiveOwntracksCmdEndpoints();
+
     return {
         activeWatcherCount: watchers.length,
         effectiveIntervalSeconds: currentEffectiveIntervalMs ? Math.round(currentEffectiveIntervalMs / 1000) : null,
         keepAliveTimeoutSeconds: KEEPALIVE_TIMEOUT_MS / 1000,
         keepAliveRecommendedSeconds: KEEPALIVE_RECOMMENDED_SECONDS,
-        commands: MANUAL_COMMANDS,
+        discoverCmdEndpoints,
+        owntracksBaseTopic,
+        presetOwntracksCmdEndpoints,
+        discoveredCommandTopics: Array.from(discoveredCmdEndpointsByTopic.keys()),
+        commands: effectiveCommands,
         watchers,
     };
 }
@@ -267,6 +360,7 @@ client.on('connect', () => {
 
 client.on('message', (topic, payload) => {
     console.log('Received Message:', topic, payload.toString());
+    discoverCmdEndpointFromTopic(topic);
 
     try {
         const parsedPayload = JSON.parse(payload.toString());
