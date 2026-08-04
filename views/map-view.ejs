@@ -183,6 +183,22 @@
             };
         }
 
+        function syncPickerRangeToNowPreservingWindow() {
+            const picker = $('input[name="datetimes"]').data('daterangepicker');
+            if (!picker || !picker.startDate || !picker.endDate) {
+                return;
+            }
+
+            const currentStart = picker.startDate.clone();
+            const currentEnd = picker.endDate.clone();
+            const windowMs = Math.max(0, currentEnd.valueOf() - currentStart.valueOf());
+            const newEnd = moment();
+            const newStart = newEnd.clone().subtract(windowMs, 'milliseconds');
+
+            picker.setStartDate(newStart);
+            picker.setEndDate(newEnd);
+        }
+
         function buildTrackerPointMap(pointsArr, sampleByInterval) {
             const parsedPoints = new Map();
             const safePoints = Array.isArray(pointsArr) ? pointsArr : [];
@@ -895,6 +911,9 @@
 
         function loadTrackersAndPoints(options = {}) {
             saveSettings();
+            if (options && options.followNow) {
+                syncPickerRangeToNowPreservingWindow();
+            }
             const xhttp = new XMLHttpRequest();
             xhttp.onload = function() {
                 try {
@@ -1719,11 +1738,14 @@
                 return;
             }
 
+            // Load immediately so the map begins following new data without waiting for the first tick.
+            loadTrackersAndPoints({ preserveViewport: true, followNow: true });
+
             manualUpdatesFollowTimer = setInterval(() => {
                 if (!map || !linesGroup || !transitionGroup) {
                     return;
                 }
-                loadTrackersAndPoints({ preserveViewport: true });
+                loadTrackersAndPoints({ preserveViewport: true, followNow: true });
             }, safeIntervalSeconds * 1000);
         }
 
@@ -2413,13 +2435,13 @@
                     </label>
                     <label for="manualMqttIntervalSelect">Manual MQTT Refresh
                         <select id="manualMqttIntervalSelect" oninput="saveSettings(); updateManualUpdateWatcherFromUi()">
-                            <option value="0">Off</option>
                             <option value="10">Every 10s</option>
-                            <option value="30">Every 30s</option>
+                            <option value="30" selected>Every 30s</option>
                             <option value="60">Every 60s</option>
                             <option value="120">Every 2m</option>
                             <option value="300">Every 5m</option>
                             <option value="600">Every 10m</option>
+                            <option value="0">Off</option>
                         </select>
                     </label>
                     <label for="stopDetectionRadiusInput">Stop Radius (m)
