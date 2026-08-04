@@ -44,6 +44,7 @@
         var allTrackers = [];
         var trackerColors = {};
         var disabledTrackers = {};
+        var liveTrackerScope = 'current';
         var trackerColorPalette = ['#3388ff', '#ff3b30', '#34a853', '#8e44ad', '#f39c12', '#1abc9c', '#e67e22', '#2c3e50'];
         var DTP;
         var map;
@@ -61,6 +62,7 @@
         var manualUpdatesKeepAliveTimer = null;
         var manualUpdatesFollowTimer = null;
         var manualUpdatesKeepAliveSeconds = 20;
+        var activeSearchFollowsNow = true;
         var stopDetectionRadiusMeters = 125;
         var stopDetectionMinPoints = 4;
         var stopDetectionMinSeconds = 180;
@@ -116,9 +118,12 @@
             return getManualMqttIntervalSeconds() > 0;
         }
 
-        function shouldShowAllTrackersLiveOverlay() {
+        function getLiveMarkerTrackerId() {
+            if (liveTrackerScope === 'all') {
+                return 'all_trackers';
+            }
             const selectedTrackerId = getCurrentSelectedTrackerId();
-            return isAutoMqttUpdateEnabled() && selectedTrackerId && selectedTrackerId !== 'all_trackers';
+            return selectedTrackerId || 'all_trackers';
         }
 
         function createLiveTrackerIcon(trackerId, color) {
@@ -183,6 +188,18 @@
             };
         }
 
+        function doesActiveSearchEndNow() {
+            const picker = $('input[name="datetimes"]').data('daterangepicker');
+            if (!picker || !picker.endDate) {
+                return false;
+            }
+
+            const nowMs = Date.now();
+            const endMs = picker.endDate.toDate().getTime();
+            const toleranceMs = 90 * 1000;
+            return Math.abs(nowMs - endMs) <= toleranceMs;
+        }
+
         function syncPickerRangeToNowPreservingWindow() {
             const picker = $('input[name="datetimes"]').data('daterangepicker');
             if (!picker || !picker.startDate || !picker.endDate) {
@@ -191,8 +208,15 @@
 
             const currentStart = picker.startDate.clone();
             const currentEnd = picker.endDate.clone();
-            const windowMs = Math.max(0, currentEnd.valueOf() - currentStart.valueOf());
             const newEnd = moment();
+
+            if (currentStart.isSame(currentStart.clone().startOf('day')) && currentStart.isSame(newEnd, 'day')) {
+                picker.setStartDate(newEnd.clone().startOf('day'));
+                picker.setEndDate(newEnd);
+                return;
+            }
+
+            const windowMs = Math.max(0, currentEnd.valueOf() - currentStart.valueOf());
             const newStart = newEnd.clone().subtract(windowMs, 'milliseconds');
 
             picker.setStartDate(newStart);
@@ -226,33 +250,31 @@
         }
 
         function refreshLiveMarkers() {
-            if (!shouldShowAllTrackersLiveOverlay()) {
+            if (!isAutoMqttUpdateEnabled()) {
                 renderLiveMarkersFromPointsMap(points);
                 return;
             }
 
-            const { secondsStart, secondsEnd } = getActiveTimeRangeSeconds();
-            fetch(`/points?tracker_id=all_trackers&seconds_start=${encodeURIComponent(secondsStart)}&seconds_end=${encodeURIComponent(secondsEnd)}`)
+            const liveTrackerId = getLiveMarkerTrackerId();
+            fetch(`/points/latest?tracker_id=${encodeURIComponent(liveTrackerId)}`)
                 .then((response) => response.json())
                 .then((response) => {
                     const trackerGroups = Array.isArray(response.trackers) ? response.trackers : [];
-                    const allTrackerPointsMap = buildTrackerPointMap(trackerGroups, false);
-                    renderLiveMarkersFromPointsMap(allTrackerPointsMap);
+                    const latestTrackerPointsMap = buildTrackerPointMap(trackerGroups, false);
+                    renderLiveMarkersFromPointsMap(latestTrackerPointsMap);
                 })
                 .catch((err) => {
-                    console.warn('Unable to load all-tracker live markers', err);
+                    console.warn('Unable to load live tracker markers', err);
                     renderLiveMarkersFromPointsMap(points);
                 });
         }
 
         function saveSettings() {
             try {
-                const selectedTrackerId = document.getElementById('selTrackers').value || '';
-                const picker = $('input[name="datetimes"]').data('daterangepicker');
+                const selectedTrackerId = document.getElementById('selTrackers').value || 'all_trackers';
                 const settings = {
                     trackerId: selectedTrackerId,
-                    startDate: picker && picker.startDate ? picker.startDate.toISOString() : '',
-                    endDate: picker && picker.endDate ? picker.endDate.toISOString() : '',
+                    liveTrackerScope: document.getElementById('liveTrackerScopeSelect').value || 'current',
                     manualMqttIntervalSeconds: document.getElementById('manualMqttIntervalSelect').value,
                     accuracyLimit: document.getElementById('accuracyFilterInput').value,
                     stopDetectionRadiusMeters: document.getElementById('stopDetectionRadiusInput').value,
@@ -362,21 +384,15 @@
             if (manualIntervalSelect && settings.manualMqttIntervalSeconds !== undefined) {
                 manualIntervalSelect.value = settings.manualMqttIntervalSeconds;
             }
+            const liveTrackerScopeSelect = document.getElementById('liveTrackerScopeSelect');
+            if (liveTrackerScopeSelect && settings.liveTrackerScope !== undefined) {
+                liveTrackerScopeSelect.value = settings.liveTrackerScope;
+                liveTrackerScope = liveTrackerScopeSelect.value || 'current';
+            }
             const segmentNavigationModeSelect = document.getElementById('segmentNavigationModeSelect');
             if (segmentNavigationModeSelect && settings.segmentNavigationMode !== undefined) {
                 segmentNavigationModeSelect.value = settings.segmentNavigationMode;
                 segmentNavigationMode = segmentNavigationModeSelect.value || 'travel';
-            }
-            const picker = $('input[name="datetimes"]').data('daterangepicker');
-            if (picker && settings.startDate && settings.endDate) {
-                const startMoment = moment(settings.startDate);
-                const endMoment = moment(settings.endDate);
-                if (startMoment.isValid()) {
-                    picker.setStartDate(startMoment);
-                }
-                if (endMoment.isValid()) {
-                    picker.setEndDate(endMoment);
-                }
             }
         }
 
@@ -911,8 +927,12 @@
 
         function loadTrackersAndPoints(options = {}) {
             saveSettings();
+            if (!options || options.evaluateFollowMode !== false) {
+                activeSearchFollowsNow = doesActiveSearchEndNow();
+            }
             if (options && options.followNow) {
                 syncPickerRangeToNowPreservingWindow();
+                activeSearchFollowsNow = true;
             }
             const xhttp = new XMLHttpRequest();
             xhttp.onload = function() {
@@ -920,9 +940,6 @@
                     const response = JSON.parse(this.responseText);
                     const trackerGroups = Array.isArray(response.trackers) ? response.trackers : [];
                     processPoints(trackerGroups);
-                    if (Array.isArray(response.tracker_ids)) {
-                        processTrackers(response.tracker_ids);
-                    }
                     showPoints(options);
                 } catch (err) {
                     console.error("Failed to load points", err);
@@ -1006,6 +1023,7 @@
             const windowPoints = getStopDetectionWindowPoints();
             const exitPoints = getStopDetectionExitPoints();
             const sampleIntervalSeconds = getStopDetectionSampleIntervalSeconds();
+            const entryPoints = Math.max(2, minPoints, windowPoints);
 
             let warnedAboutOutOfOrder = false;
 
@@ -1033,36 +1051,34 @@
 
                 warnAboutOutOfOrder(trackerId, pointsArr);
 
-                const initialWindowSize = Math.min(windowPoints, pointsArr.length);
-                const initialWindowPoints = pointsArr.slice(0, initialWindowSize);
-                const initialWindowCenter = getCentroid(initialWindowPoints);
-                const initialWindowMaxDistance = initialWindowCenter
-                    ? initialWindowPoints.reduce((max, candidate) => {
-                        const distance = calculateDistance(candidate.latitude, candidate.longitude, initialWindowCenter.latitude, initialWindowCenter.longitude, 'meters');
-                        return Math.max(max, distance);
-                    }, 0)
-                    : Infinity;
-                const startsInsideStopCluster = initialWindowPoints.length >= 2 && initialWindowMaxDistance <= radiusMeters;
-                const initialPointTime = new Date(pointsArr[0].time).getTime();
-
-                let currentMode = startsInsideStopCluster ? Mode.STOP : Mode.MOVING;
-                let recentPoints = [];
-                let currentSegmentPoints = [];
-                let currentSegmentStartTime = null;
-                let currentSegmentEndTime = null;
-                let stopCenter = startsInsideStopCluster ? initialWindowCenter : null;
-                let stopStartTime = startsInsideStopCluster ? initialPointTime : null;
-                let stopPoint = null;
-                let exitCount = 0;
-                let previousStopEndTime = null;
-                let currentStopStartTime = startsInsideStopCluster ? initialPointTime : null;
-                let pendingTravelPoints = [];
-                let pendingTravelStartPoint = null;
-                let pendingTravelStartTime = null;
-
                 const normalizeSegmentTime = (timeValue) => {
                     const time = new Date(timeValue).getTime();
                     return Number.isFinite(time) ? time : null;
+                };
+
+                const getPointTime = (point) => normalizeSegmentTime(point && point.time);
+
+                const analyzeCluster = (clusterPoints) => {
+                    const safePoints = Array.isArray(clusterPoints) ? clusterPoints.filter(Boolean) : [];
+                    if (!safePoints.length) {
+                        return { valid: false, center: null, maxDistance: Infinity };
+                    }
+
+                    const center = getCentroid(safePoints);
+                    if (!center) {
+                        return { valid: false, center: null, maxDistance: Infinity };
+                    }
+
+                    const maxDistance = safePoints.reduce((max, candidate) => {
+                        const distance = calculateDistance(candidate.latitude, candidate.longitude, center.latitude, center.longitude, 'meters');
+                        return Math.max(max, distance);
+                    }, 0);
+
+                    return {
+                        valid: maxDistance <= radiusMeters,
+                        center,
+                        maxDistance,
+                    };
                 };
 
                 const finalizeSegment = (type, points, startTime, endTime, center = null) => {
@@ -1111,123 +1127,141 @@
                     });
                 };
 
+                let currentMode = Mode.MOVING;
+                let movingPoints = [];
+                let candidateStopPoints = [];
+                let stopPoints = [];
+                let stopCenter = null;
+                let pendingExitPoints = [];
+
+                const pushMovingPoint = (point) => {
+                    if (!point) {
+                        return;
+                    }
+                    movingPoints.push(point);
+                };
+
                 pointsArr.forEach((point) => {
-                    const pointTime = new Date(point.time).getTime();
-                    recentPoints.push(point);
-                    if (recentPoints.length > windowPoints) {
-                        recentPoints.shift();
+                    const pointTime = getPointTime(point);
+                    if (pointTime === null) {
+                        return;
                     }
 
                     if (currentMode === Mode.MOVING) {
-                        if (currentSegmentPoints.length === 0) {
-                            currentSegmentPoints = [point];
-                            currentSegmentStartTime = pointTime;
-                            currentSegmentEndTime = pointTime;
+                        candidateStopPoints.push(point);
+
+                        let candidateState = analyzeCluster(candidateStopPoints);
+                        while (candidateStopPoints.length > 1 && !candidateState.valid) {
+                            pushMovingPoint(candidateStopPoints.shift());
+                            candidateState = analyzeCluster(candidateStopPoints);
+                        }
+
+                        const candidateStartTime = getPointTime(candidateStopPoints[0]);
+                        const candidateDurationSeconds = candidateStartTime === null
+                            ? 0
+                            : Math.max(0, (pointTime - candidateStartTime) / 1000);
+
+                        if (candidateStopPoints.length >= entryPoints && candidateState.valid && candidateDurationSeconds >= minSeconds) {
+                            const stopEntryPoint = candidateStopPoints[0] || null;
+                            if (movingPoints.length) {
+                                const movingSegmentPoints = stopEntryPoint
+                                    ? movingPoints.concat(stopEntryPoint)
+                                    : movingPoints;
+                                finalizeSegment(
+                                    Mode.MOVING,
+                                    movingSegmentPoints,
+                                    getPointTime(movingSegmentPoints[0]),
+                                    getPointTime(movingSegmentPoints[movingSegmentPoints.length - 1])
+                                );
+                            }
+
+                            stopPoints = candidateStopPoints.slice();
+                            stopCenter = candidateState.center;
+                            candidateStopPoints = [];
+                            pendingExitPoints = [];
+                            currentMode = Mode.STOP;
+                        }
+
+                        return;
+                    }
+
+                    if (pendingExitPoints.length) {
+                        const recoveredCluster = stopPoints.concat(pendingExitPoints, point);
+                        const recoveredState = analyzeCluster(recoveredCluster);
+                        if (recoveredState.valid) {
+                            stopPoints = recoveredCluster;
+                            stopCenter = recoveredState.center;
+                            pendingExitPoints = [];
                             return;
                         }
 
-                        const windowCenter = getCentroid(recentPoints);
-                        const maxDistanceFromCenter = recentPoints.reduce((max, candidate) => {
-                            const distance = calculateDistance(candidate.latitude, candidate.longitude, windowCenter.latitude, windowCenter.longitude, 'meters');
-                            return Math.max(max, distance);
-                        }, 0);
-
-                        if (maxDistanceFromCenter <= radiusMeters) {
-                            exitCount = 0;
-                            if (stopStartTime === null) {
-                                stopStartTime = pointTime;
-                                stopCenter = windowCenter;
-                                currentStopStartTime = pointTime;
-                            }
-
-                            const durationSeconds = (pointTime - stopStartTime) / 1000;
-                            if (durationSeconds >= minSeconds) {
-                                const stopBoundaryTime = stopStartTime || pointTime;
-                                const travelStartTime = previousStopEndTime || currentSegmentStartTime;
-                                finalizeSegment(Mode.MOVING, currentSegmentPoints, travelStartTime, stopBoundaryTime);
-                                currentSegmentPoints = [];
-                                currentSegmentStartTime = null;
-                                currentSegmentEndTime = null;
-                                currentMode = Mode.STOP;
-                                recentPoints = [];
-                                stopStartTime = null;
-                                stopCenter = null;
-                                currentStopStartTime = stopBoundaryTime;
-                            }
-                        } else {
-                            exitCount++;
-                            currentSegmentPoints.push(point);
-                            currentSegmentEndTime = pointTime;
-                            if (exitCount >= exitPoints) {
-                                stopStartTime = null;
-                                stopCenter = null;
-                                exitCount = 0;
-                            }
-                        }
-                    } else if (currentMode === Mode.STOP) {
-                        const windowCenter = getCentroid(recentPoints);
-                        const stopReferenceCenter = stopCenter || windowCenter;
-                        const currentPointDistanceMeters = stopReferenceCenter
-                            ? calculateDistance(point.latitude, point.longitude, stopReferenceCenter.latitude, stopReferenceCenter.longitude, 'meters')
-                            : 0;
-                        const isCurrentPointOutsideStop = currentPointDistanceMeters > radiusMeters;
-
-                        if (!isCurrentPointOutsideStop) {
-                            exitCount = 0;
-                            pendingTravelPoints = [];
-                            pendingTravelStartPoint = null;
-                            pendingTravelStartTime = null;
-                            if (stopStartTime === null) {
-                                stopStartTime = pointTime;
-                                stopCenter = stopReferenceCenter || windowCenter;
-                                currentStopStartTime = pointTime;
-                            }
-                            stopCenter = windowCenter || stopReferenceCenter;
-                            currentSegmentPoints.push(point);
-                            currentSegmentEndTime = pointTime;
-                        } else {
-                            exitCount++;
-                            if (exitCount === 1) {
-                                pendingTravelStartPoint = currentSegmentPoints.length ? currentSegmentPoints[currentSegmentPoints.length - 1] : point;
-                                pendingTravelStartTime = currentSegmentEndTime || pointTime;
-                            }
-                            pendingTravelPoints.push(point);
-                            if (exitCount >= exitPoints) {
-                                const stopSegmentPoints = currentSegmentPoints.length ? currentSegmentPoints : [pendingTravelStartPoint || point];
-                                const stopStartBoundaryTime = currentStopStartTime || pendingTravelStartTime || pointTime;
-                                const stopEndTime = pendingTravelStartTime || pointTime;
-                                finalizeSegment(Mode.STOP, stopSegmentPoints, stopStartBoundaryTime, stopEndTime, stopCenter);
-                                const travelPoints = [];
-                                if (pendingTravelStartPoint) {
-                                    travelPoints.push(pendingTravelStartPoint);
-                                }
-                                travelPoints.push(...pendingTravelPoints);
-                                currentSegmentPoints = travelPoints.length ? travelPoints : [point];
-                                currentSegmentStartTime = stopEndTime;
-                                currentSegmentEndTime = pointTime;
-                                currentMode = Mode.MOVING;
-                                stopStartTime = null;
-                                stopCenter = null;
-                                exitCount = 0;
-                                previousStopEndTime = stopEndTime;
-                                currentStopStartTime = null;
-                                pendingTravelPoints = [];
-                                pendingTravelStartPoint = null;
-                                pendingTravelStartTime = null;
-                            }
+                        const resumedStopCluster = stopPoints.concat(point);
+                        const resumedStopState = analyzeCluster(resumedStopCluster);
+                        if (resumedStopState.valid) {
+                            stopPoints = stopPoints.concat(pendingExitPoints, point);
+                            stopCenter = resumedStopState.center;
+                            pendingExitPoints = [];
+                            return;
                         }
                     }
+
+                    const expandedStopCluster = stopPoints.concat(point);
+                    const expandedStopState = analyzeCluster(expandedStopCluster);
+                    if (expandedStopState.valid) {
+                        stopPoints = expandedStopCluster;
+                        stopCenter = expandedStopState.center;
+                        pendingExitPoints = [];
+                        return;
+                    }
+
+                    pendingExitPoints.push(point);
+                    if (pendingExitPoints.length < exitPoints) {
+                        return;
+                    }
+
+                    if (stopPoints.length) {
+                        const stopExitPoint = stopPoints[stopPoints.length - 1] || null;
+                        finalizeSegment(
+                            Mode.STOP,
+                            stopPoints,
+                            getPointTime(stopPoints[0]),
+                            getPointTime(stopPoints[stopPoints.length - 1]),
+                            stopCenter || analyzeCluster(stopPoints).center
+                        );
+
+                        movingPoints = stopExitPoint
+                            ? [stopExitPoint].concat(pendingExitPoints)
+                            : pendingExitPoints.slice();
+                    } else {
+                        movingPoints = pendingExitPoints.slice();
+                    }
+                    candidateStopPoints = [];
+                    stopPoints = [];
+                    stopCenter = null;
+                    pendingExitPoints = [];
+                    currentMode = Mode.MOVING;
                 });
 
-                if (currentSegmentPoints.length) {
-                    const segmentType = currentMode === Mode.STOP ? Mode.STOP : Mode.MOVING;
-                    const fallbackStart = currentSegmentStartTime || pointsArr[0].time;
-                    const fallbackEnd = currentSegmentEndTime || pointsArr[pointsArr.length - 1].time;
-                    const effectiveStartTime = segmentType === Mode.MOVING
-                        ? (previousStopEndTime || fallbackStart)
-                        : (currentStopStartTime || fallbackStart);
-                    finalizeSegment(segmentType, currentSegmentPoints, effectiveStartTime, fallbackEnd, stopCenter);
+                if (currentMode === Mode.STOP) {
+                    const trailingStopPoints = stopPoints.concat(pendingExitPoints);
+                    const trailingStopState = analyzeCluster(trailingStopPoints);
+                    finalizeSegment(
+                        Mode.STOP,
+                        trailingStopPoints,
+                        getPointTime(trailingStopPoints[0]),
+                        getPointTime(trailingStopPoints[trailingStopPoints.length - 1]),
+                        trailingStopState.valid ? trailingStopState.center : stopCenter
+                    );
+                    return;
                 }
+
+                const trailingMovingPoints = movingPoints.concat(candidateStopPoints);
+                finalizeSegment(
+                    Mode.MOVING,
+                    trailingMovingPoints,
+                    getPointTime(trailingMovingPoints[0]),
+                    getPointTime(trailingMovingPoints[trailingMovingPoints.length - 1])
+                );
             });
         }
 
@@ -1347,6 +1381,9 @@
                 return;
             }
 
+            const liveScopeLabel = liveTrackerScope === 'all' ? 'All trackers in DB' : 'Current tracker only';
+            const liveRefreshLabel = isAutoMqttUpdateEnabled() ? 'Live markers refreshing' : 'Live markers off';
+
             const trackerRows = trackers.length
                 ? trackers.map((trackerId) => {
                     const color = getTrackerColor(trackerId);
@@ -1376,6 +1413,12 @@
                         <span class='tracker-legend-stop-point'></span>
                         <span class='tracker-legend-label'>Stop point</span>
                     </div>
+                </div>
+                <div class='tracker-legend-section'>
+                    <div class='tracker-legend-title'>Live Markers</div>
+                    <div class='tracker-legend-status'>${liveRefreshLabel}</div>
+                    <div class='tracker-legend-substatus'>Scope: ${liveScopeLabel}</div>
+                    <div class='tracker-legend-substatus'>Known trackers: ${trackers.length}</div>
                 </div>
             `;
         }
@@ -1418,12 +1461,30 @@
             renderTrackerLegend();
         }
 
+        function fetchTrackersCatalog(options = {}) {
+            const xhttp = new XMLHttpRequest();
+            xhttp.onload = function() {
+                try {
+                    const response = JSON.parse(this.responseText);
+                    processTrackers(Array.isArray(response) ? response : response.trackers || []);
+                    if (options && typeof options.onLoaded === 'function') {
+                        options.onLoaded();
+                    }
+                } catch (err) {
+                    console.error("Failed to load trackers", err);
+                }
+            }
+            xhttp.open("GET", "/trackers", true);
+            xhttp.send();
+        }
+
         function processTrackers(trackersList) {
             // Process trackers as needed
             console.log("Received Trackers: ", trackersList);
             const incomingTrackers = Array.isArray(trackersList) ? trackersList : [];
             if (incomingTrackers.length) {
-                allTrackers = incomingTrackers;
+                const mergedTrackers = new Set([...(Array.isArray(allTrackers) ? allTrackers : []), ...incomingTrackers]);
+                allTrackers = Array.from(mergedTrackers).sort((left, right) => String(left).localeCompare(String(right)));
             }
             trackers = Array.isArray(allTrackers) ? allTrackers : [];
             const savedSettings = loadSettings();
@@ -1638,7 +1699,7 @@
         function initDateTimePicker() {
             const picker = $('input[name="datetimes"]').daterangepicker({
                 timePicker: true,
-                startDate: moment().startOf('hour').add(-14, 'hour'),
+                startDate: moment().startOf('day'),
                 endDate: moment(),
                 locale: {
                     format: 'M/DD hh:mm A'
@@ -1651,18 +1712,7 @@
         }
 
         function loadTrackers() {
-            const xhttp = new XMLHttpRequest();
-            xhttp.onload = function() {
-                try {
-                    const response = JSON.parse(this.responseText);
-                    processTrackers(Array.isArray(response) ? response : response.trackers || []);
-                    loadTrackersAndPoints();
-                } catch (err) {
-                    console.error("Failed to load trackers", err);
-                }
-            }
-            xhttp.open("GET", "/trackers", true);
-            xhttp.send();
+            fetchTrackersCatalog({ onLoaded: () => loadTrackersAndPoints() });
         }
 
         function getOrCreateManualUpdatesClientId() {
@@ -1738,14 +1788,24 @@
                 return;
             }
 
-            // Load immediately so the map begins following new data without waiting for the first tick.
-            loadTrackersAndPoints({ preserveViewport: true, followNow: true });
+            activeSearchFollowsNow = doesActiveSearchEndNow();
+            fetchTrackersCatalog();
+            if (activeSearchFollowsNow) {
+                loadTrackersAndPoints({ preserveViewport: true, followNow: true, evaluateFollowMode: false });
+            } else {
+                refreshLiveMarkers();
+            }
 
             manualUpdatesFollowTimer = setInterval(() => {
                 if (!map || !linesGroup || !transitionGroup) {
                     return;
                 }
-                loadTrackersAndPoints({ preserveViewport: true, followNow: true });
+                fetchTrackersCatalog();
+                if (activeSearchFollowsNow) {
+                    loadTrackersAndPoints({ preserveViewport: true, followNow: true, evaluateFollowMode: false });
+                    return;
+                }
+                refreshLiveMarkers();
             }, safeIntervalSeconds * 1000);
         }
 
@@ -2215,6 +2275,17 @@
             font-size: 12px;
             color: #64748b;
         }
+        .tracker-legend-status {
+            font-size: 12px;
+            font-weight: 600;
+            color: #0f172a;
+            margin-bottom: 2px;
+        }
+        .tracker-legend-substatus {
+            font-size: 11px;
+            color: #64748b;
+            margin-bottom: 2px;
+        }
         .settings-overlay {
             position: fixed;
             inset: 0;
@@ -2417,7 +2488,7 @@
                         <input id="inp_quick_hours" type="number" oninput="quickHoursUpdated(); saveSettings();">
                     </label>
                     <label for="inp_quick_days">Last X Days
-                        <input id="inp_quick_days" type="number" oninput="quickDaysUpdated(); saveSettings();">
+                        <input id="inp_quick_days" type="number" value="1" oninput="quickDaysUpdated(); saveSettings();">
                     </label>
                     <label for="inp_quick_days_ago">X Days Ago
                         <input id="inp_quick_days_ago" type="number" oninput="quickDaysAgoUpdated(); saveSettings();">
@@ -2442,6 +2513,12 @@
                             <option value="300">Every 5m</option>
                             <option value="600">Every 10m</option>
                             <option value="0">Off</option>
+                        </select>
+                    </label>
+                    <label for="liveTrackerScopeSelect">Live Trackers
+                        <select id="liveTrackerScopeSelect" oninput="saveSettings(); refreshLiveMarkers()">
+                            <option value="current">Current tracker only</option>
+                            <option value="all">All trackers in DB</option>
                         </select>
                     </label>
                     <label for="stopDetectionRadiusInput">Stop Radius (m)

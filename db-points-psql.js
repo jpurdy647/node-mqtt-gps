@@ -103,6 +103,33 @@ class pointsDBConnector {
       */
   }
 
+  async queryLatestPoints(tracker_ids, errorCallback = null) {
+    console.log("Querying latest points for tracker_ids:", tracker_ids);
+
+    if (!Array.isArray(tracker_ids) || tracker_ids.length === 0 || tracker_ids[0] === "all_trackers") {
+      tracker_ids = await this.getDistinctTrackers(errorCallback);
+    }
+
+    const queries = tracker_ids.map((tracker_id) => {
+      return {
+        text: `
+        SELECT *
+        FROM gps_points
+        WHERE tracker_id = '${tracker_id}'
+        ORDER BY time DESC
+        LIMIT 1
+        `
+      };
+    });
+
+    const results = await Promise.all(queries.map((query) => pool.query(query)));
+
+    return results.map((result, index) => ({
+      tracker_id: result.rows.length > 0 ? result.rows[0].tracker_id : tracker_ids[index],
+      results: result.rows,
+    }));
+  }
+
 
   queryPointsPromise(hours, tracker_id) {
     return this.queryPoints(

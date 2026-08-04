@@ -91,6 +91,28 @@ app.get("/points",[
   }
 });
 
+app.get("/points/latest", [
+    check('tracker_id').trim().escape()
+  ], async function (req, res) {
+  try {
+    const selectedTrackerId = req.query.tracker_id;
+    let trackerIds = [];
+
+    if (selectedTrackerId && selectedTrackerId !== "all_trackers") {
+      trackerIds = [selectedTrackerId];
+    } else {
+      trackerIds = ["all_trackers"];
+    }
+
+    const result = await pointsDB.queryLatestPoints(trackerIds);
+    const processedPoints = TracksProcessor.processPath(result);
+    res.json({ trackers: processedPoints, tracker_ids: trackerIds });
+  } catch (err) {
+    console.error("Error processing latest points request:", err);
+    res.status(500).send(err.stack);
+  }
+});
+
 
 app.get("/times", [
     check('tracker_id').trim().escape() // Sanitizes and escapes the 'searchQuery' parameter
