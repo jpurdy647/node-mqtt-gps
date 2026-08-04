@@ -44,20 +44,20 @@
         var allTrackers = [];
         var trackerColors = {};
         var disabledTrackers = {};
-        var liveTrackerScope = 'current';
         var trackerColorPalette = ['#3388ff', '#ff3b30', '#34a853', '#8e44ad', '#f39c12', '#1abc9c', '#e67e22', '#2c3e50'];
         var DTP;
         var map;
         var linesGroup;
         var transitionGroup;
         var liveMarkersGroup;
+        var liveTrackerExtensionLines = new Map();
         var segmentLayers = [];
         var renderedPointMarkersById = new Map();
         var highlightedSegment = null;
         var detectedSegments = [];
-        var showIndividualPoints = true;
         var selectedSegmentId = null;
-        var segmentNavigationMode = 'travel';
+        var selectedSegmentPointIndex = 0;
+        var segmentDebugStatusTimer = null;
         var manualUpdatesClientId = null;
         var manualUpdatesKeepAliveTimer = null;
         var manualUpdatesFollowTimer = null;
@@ -65,12 +65,63 @@
         var activeSearchFollowsNow = true;
         var isHydratingStartupSettings = true;
         var startupSettingsSnapshot = null;
+        var pointsRequestInFlight = null;
+        var pendingPointsRequest = null;
+        var pointsRequestTimeoutMs = 30000;
+        var pointsRequestTimeoutTimer = null;
+        var pointsRequestSequence = 0;
         var stopDetectionRadiusMeters = 125;
         var stopDetectionMinPoints = 4;
         var stopDetectionMinSeconds = 180;
         var stopDetectionWindowPoints = 6;
         var stopDetectionExitPoints = 3;
         var stopDetectionSampleIntervalSeconds = 30;
+
+        function createDefaultSettingsState() {
+            return {
+                trackerId: 'all_trackers',
+                quickHoursValue: '',
+                quickDaysValue: '',
+                quickDaysAgoValue: '',
+                liveTrackerScope: 'current',
+                manualMqttIntervalSeconds: '30',
+                accuracyLimit: '150',
+                stopDetectionRadiusMeters: 125,
+                stopDetectionMinSeconds: 180,
+                stopDetectionWindowPoints: 6,
+                stopDetectionExitPoints: 3,
+                stopDetectionSampleIntervalSeconds: 30,
+                segmentNavigationMode: 'travel',
+                showIndividualPoints: true,
+                trackerColors: {},
+                disabledTrackers: {},
+                timeframeStartDate: null,
+                timeframeEndDate: null,
+                timeframeFollowsNow: false,
+                timeframeDurationMs: null,
+                timeframeEndOffsetMs: null,
+                timeframeAnchoredToDayStart: false,
+            };
+        }
+
+        var settingsState = createDefaultSettingsState();
+
+        function hydrateSettingsState(settings = {}) {
+            const sourceSettings = settings && typeof settings === 'object' ? settings : {};
+            const mergedSettings = {
+                ...createDefaultSettingsState(),
+                ...settingsState,
+                ...sourceSettings,
+            };
+            settingsState = mergedSettings;
+            trackerColors = settingsState.trackerColors && typeof settingsState.trackerColors === 'object'
+                ? { ...settingsState.trackerColors }
+                : {};
+            disabledTrackers = settingsState.disabledTrackers && typeof settingsState.disabledTrackers === 'object'
+                ? { ...settingsState.disabledTrackers }
+                : {};
+            return settingsState;
+        }
 
         const Transition = {
             STOP_TO_MOVING: "STOP_TO_MOVING",
@@ -123,6 +174,11 @@
                 return trackerSelect.value;
             }
 
+            const stateTrackerId = settingsState && settingsState.trackerId;
+            if (stateTrackerId) {
+                return stateTrackerId;
+            }
+
             const savedSettings = loadSettings();
             if (savedSettings && savedSettings.trackerId) {
                 return savedSettings.trackerId;
@@ -155,7 +211,7 @@
         }
 
         function getLiveMarkerTrackerId() {
-            if (liveTrackerScope === 'all') {
+            if (settingsState && settingsState.liveTrackerScope === 'all') {
                 return 'all_trackers';
             }
             const selectedTrackerId = getCurrentSelectedTrackerId();
@@ -309,8 +365,9 @@
                 return;
             }
 
-            // Historical windows reset to last one day on restore.
-            setPickerToLastOneDay();
+            // Preserve saved historical windows exactly as selected.
+            picker.setStartDate(savedStart);
+            picker.setEndDate(savedEnd);
         }
 
         function doesActiveSearchEndNow() {
@@ -320,6 +377,10 @@
             }
 
             return isTimeframeRelativeToNow(picker.endDate);
+        }
+
+        function shouldFollowTimeframeNow() {
+            return doesActiveSearchEndNow() || Boolean(settingsState && settingsState.timeframeFollowsNow);
         }
 
         function syncPickerRangeToNowPreservingWindow() {
@@ -371,7 +432,120 @@
             return parsedPoints;
         }
 
-        function refreshLiveMarkers() {
+        function clearLiveTrackerExtensionLines() {
+            if (!(liveTrackerExtensionLines instanceof Map) || !liveTrackerExtensionLines.size) {
+                return;
+            }
+
+            liveTrackerExtensionLines.forEach((layer) => {
+                if (layer && linesGroup && linesGroup.removeLayer) {
+                    linesGroup.removeLayer(layer);
+                }
+            });
+            liveTrackerExtensionLines.clear();
+        }
+
+        function updateLiveTrackerExtensionLineForTracker(trackerId) {
+            if (!linesGroup || !trackerId || trackerId === 'all_trackers') {
+                return;
+            }
+
+            const trackerPointsMap = points && points.get ? points.get(trackerId) : null;
+            const trackerPoints = trackerPointsMap instanceof Map
+                ? Array.from(trackerPointsMap.values()).filter(Boolean).sort((left, right) => new Date(left.time) - new Date(right.time))
+                : [];
+
+            const existingLayer = liveTrackerExtensionLines.get(trackerId) || null;
+            if (trackerPoints.length < 2) {
+                if (existingLayer && linesGroup.removeLayer) {
+                    linesGroup.removeLayer(existingLayer);
+                }
+                liveTrackerExtensionLines.delete(trackerId);
+                return;
+            }
+
+            const latLngs = trackerPoints.map((point) => [point.latitude, point.longitude]);
+            if (existingLayer && existingLayer.setLatLngs) {
+                existingLayer.setLatLngs(latLngs);
+                return;
+            }
+
+            const trackerColor = getTrackerColor(trackerId);
+            const lineLayer = L.polyline(latLngs, {
+                color: trackerColor,
+                weight: 2.4,
+                opacity: 0.95,
+            }).addTo(linesGroup);
+            lineLayer._jpBaseStyle = { color: trackerColor, weight: 2.4, opacity: 0.95 };
+            liveTrackerExtensionLines.set(trackerId, lineLayer);
+        }
+
+        function mergeLatestPointsIntoVisibleTrack(latestTrackerPointsMap) {
+            const selectedTrackerId = getCurrentSelectedTrackerId();
+            if (!selectedTrackerId || selectedTrackerId === 'all_trackers') {
+                return false;
+            }
+
+            if (!shouldFollowTimeframeNow()) {
+                return false;
+            }
+
+            const latestTrackerPoints = latestTrackerPointsMap && latestTrackerPointsMap.get
+                ? latestTrackerPointsMap.get(selectedTrackerId)
+                : null;
+            if (!latestTrackerPoints || !(latestTrackerPoints instanceof Map) || !latestTrackerPoints.size) {
+                return false;
+            }
+
+            const existingTrackerPoints = points && points.get
+                ? points.get(selectedTrackerId)
+                : null;
+            if (!(existingTrackerPoints instanceof Map)) {
+                return false;
+            }
+
+            const existingPointList = Array.from(existingTrackerPoints.values()).filter(Boolean);
+            const latestExistingPointTime = existingPointList.reduce((max, point) => {
+                const pointTime = point && point.time ? new Date(point.time).getTime() : null;
+                if (!Number.isFinite(pointTime)) {
+                    return max;
+                }
+                return Math.max(max, pointTime);
+            }, Number.NEGATIVE_INFINITY);
+
+            let addedAnyPoint = false;
+            latestTrackerPoints.forEach((candidatePoint, candidateKey) => {
+                if (!candidatePoint) {
+                    return;
+                }
+
+                const pointTime = candidatePoint.time ? new Date(candidatePoint.time).getTime() : null;
+                const candidatePuid = candidatePoint.puid || candidateKey || `${candidatePoint.time || ''}:${candidatePoint.latitude || ''}:${candidatePoint.longitude || ''}`;
+                if (!candidatePuid || !Number.isFinite(pointTime)) {
+                    return;
+                }
+
+                if (existingTrackerPoints.has(candidatePuid)) {
+                    return;
+                }
+
+                if (Number.isFinite(latestExistingPointTime) && pointTime <= latestExistingPointTime) {
+                    return;
+                }
+
+                existingTrackerPoints.set(candidatePuid, {
+                    ...candidatePoint,
+                    puid: candidatePuid,
+                    localTime: candidatePoint.localTime || (candidatePoint.time ? new Date(candidatePoint.time).toLocaleString() : null),
+                });
+                addedAnyPoint = true;
+            });
+
+            return addedAnyPoint;
+        }
+
+        function refreshLiveMarkers(options = {}) {
+            const mergeIntoTrackLines = options.mergeIntoTrackLines !== false;
             if (!isAutoMqttUpdateEnabled()) {
                 renderLiveMarkersFromPointsMap(points);
                 return;
@@ -383,6 +557,13 @@
                 .then((response) => {
                     const trackerGroups = Array.isArray(response.trackers) ? response.trackers : [];
                     const latestTrackerPointsMap = buildTrackerPointMap(trackerGroups, false);
+
+                    if (mergeIntoTrackLines && mergeLatestPointsIntoVisibleTrack(latestTrackerPointsMap)) {
+                        updateLiveTrackerExtensionLineForTracker(getCurrentSelectedTrackerId());
+                        renderLiveMarkersFromPointsMap(latestTrackerPointsMap);
+                        return;
+                    }
+
                     renderLiveMarkersFromPointsMap(latestTrackerPointsMap);
                 })
                 .catch((err) => {
@@ -420,8 +601,9 @@
                 const quickHoursInput = document.getElementById('inp_quick_hours');
                 const quickDaysInput = document.getElementById('inp_quick_days');
                 const quickDaysAgoInput = document.getElementById('inp_quick_days_ago');
-                const settings = {
+                const nextSettings = hydrateSettingsState({
                     ...existingSettings,
+                    ...settingsState,
                     trackerId: selectedTrackerId,
                     ...timeframeSettings,
                     quickHoursValue: quickHoursInput ? quickHoursInput.value : '',
@@ -436,12 +618,16 @@
                     stopDetectionExitPoints: document.getElementById('stopDetectionExitPointsInput').value,
                     stopDetectionSampleIntervalSeconds: document.getElementById('stopDetectionSampleIntervalSecondsInput').value,
                     segmentNavigationMode: document.getElementById('segmentNavigationModeSelect').value,
-                    showIndividualPoints,
-                    trackerColors,
-                    disabledTrackers,
-                };
+                    showIndividualPoints: settingsState.showIndividualPoints,
+                    trackerColors: { ...(trackerColors || {}) },
+                    disabledTrackers: { ...(disabledTrackers || {}) },
+                });
 
-                const payload = JSON.stringify(settings);
+                settingsState = nextSettings;
+                trackerColors = { ...(settingsState.trackerColors || {}) };
+                disabledTrackers = { ...(settingsState.disabledTrackers || {}) };
+
+                const payload = JSON.stringify(settingsState);
 
                 const cookieValue = 'mapViewSettings=' + encodeURIComponent(payload) + '; path=/; max-age=' + (60 * 60 * 24 * 30) + '; SameSite=Lax';
 
@@ -489,15 +675,11 @@
             if (!settings) {
                 return;
             }
-            showIndividualPoints = settings.showIndividualPoints !== false;
-            if (settings.trackerColors) {
-                trackerColors = { ...settings.trackerColors };
-            }
-            disabledTrackers = settings.disabledTrackers ? { ...settings.disabledTrackers } : {};
+            hydrateSettingsState(settings);
             const trackerSelect = document.getElementById('selTrackers');
             const skipTrackerSelectionRestore = Boolean(options && options.skipTrackerSelectionRestore);
-            if (!skipTrackerSelectionRestore && trackerSelect && settings.trackerId !== undefined) {
-                const requestedTracker = settings.trackerId || 'all_trackers';
+            if (!skipTrackerSelectionRestore && trackerSelect && settingsState.trackerId !== undefined) {
+                const requestedTracker = settingsState.trackerId || 'all_trackers';
                 const offeredValues = Array.from(trackerSelect.options).map((option) => option.value);
                 if (offeredValues.includes(requestedTracker)) {
                     trackerSelect.value = requestedTracker;
@@ -506,60 +688,57 @@
                 }
             }
             const accuracyInput = document.getElementById('accuracyFilterInput');
-            if (accuracyInput && settings.accuracyLimit !== undefined) {
-                accuracyInput.value = settings.accuracyLimit;
+            if (accuracyInput && settingsState.accuracyLimit !== undefined) {
+                accuracyInput.value = settingsState.accuracyLimit;
             }
             const radiusInput = document.getElementById('stopDetectionRadiusInput');
-            if (radiusInput && settings.stopDetectionRadiusMeters !== undefined) {
-                radiusInput.value = settings.stopDetectionRadiusMeters;
+            if (radiusInput && settingsState.stopDetectionRadiusMeters !== undefined) {
+                radiusInput.value = settingsState.stopDetectionRadiusMeters;
             }
             const minSecondsInput = document.getElementById('stopDetectionMinSecondsInput');
-            if (minSecondsInput && settings.stopDetectionMinSeconds !== undefined) {
-                minSecondsInput.value = settings.stopDetectionMinSeconds;
+            if (minSecondsInput && settingsState.stopDetectionMinSeconds !== undefined) {
+                minSecondsInput.value = settingsState.stopDetectionMinSeconds;
             }
             const windowPointsInput = document.getElementById('stopDetectionWindowPointsInput');
-            if (windowPointsInput && settings.stopDetectionWindowPoints !== undefined) {
-                windowPointsInput.value = settings.stopDetectionWindowPoints;
+            if (windowPointsInput && settingsState.stopDetectionWindowPoints !== undefined) {
+                windowPointsInput.value = settingsState.stopDetectionWindowPoints;
             }
             const exitPointsInput = document.getElementById('stopDetectionExitPointsInput');
-            if (exitPointsInput && settings.stopDetectionExitPoints !== undefined) {
-                exitPointsInput.value = settings.stopDetectionExitPoints;
+            if (exitPointsInput && settingsState.stopDetectionExitPoints !== undefined) {
+                exitPointsInput.value = settingsState.stopDetectionExitPoints;
             }
             const sampleIntervalInput = document.getElementById('stopDetectionSampleIntervalSecondsInput');
-            if (sampleIntervalInput && settings.stopDetectionSampleIntervalSeconds !== undefined) {
-                sampleIntervalInput.value = settings.stopDetectionSampleIntervalSeconds;
+            if (sampleIntervalInput && settingsState.stopDetectionSampleIntervalSeconds !== undefined) {
+                sampleIntervalInput.value = settingsState.stopDetectionSampleIntervalSeconds;
             }
             const quickHoursInput = document.getElementById('inp_quick_hours');
-            if (quickHoursInput && settings.quickHoursValue !== undefined) {
-                quickHoursInput.value = settings.quickHoursValue;
+            if (quickHoursInput && settingsState.quickHoursValue !== undefined) {
+                quickHoursInput.value = settingsState.quickHoursValue;
             }
             const quickDaysInput = document.getElementById('inp_quick_days');
-            if (quickDaysInput && settings.quickDaysValue !== undefined) {
-                quickDaysInput.value = settings.quickDaysValue;
+            if (quickDaysInput && settingsState.quickDaysValue !== undefined) {
+                quickDaysInput.value = settingsState.quickDaysValue;
             }
             const quickDaysAgoInput = document.getElementById('inp_quick_days_ago');
-            if (quickDaysAgoInput && settings.quickDaysAgoValue !== undefined) {
-                quickDaysAgoInput.value = settings.quickDaysAgoValue;
+            if (quickDaysAgoInput && settingsState.quickDaysAgoValue !== undefined) {
+                quickDaysAgoInput.value = settingsState.quickDaysAgoValue;
             }
             const showPointsToggle = document.getElementById('showIndividualPointsToggle');
-            if (showPointsToggle && settings.showIndividualPoints !== undefined) {
-                showPointsToggle.checked = settings.showIndividualPoints;
-                showIndividualPoints = settings.showIndividualPoints;
+            if (showPointsToggle && settingsState.showIndividualPoints !== undefined) {
+                showPointsToggle.checked = settingsState.showIndividualPoints;
             }
             const manualIntervalSelect = document.getElementById('manualMqttIntervalSelect');
-            if (manualIntervalSelect && settings.manualMqttIntervalSeconds !== undefined) {
-                manualIntervalSelect.value = settings.manualMqttIntervalSeconds;
+            if (manualIntervalSelect && settingsState.manualMqttIntervalSeconds !== undefined) {
+                manualIntervalSelect.value = settingsState.manualMqttIntervalSeconds;
             }
             const liveTrackerScopeSelect = document.getElementById('liveTrackerScopeSelect');
-            if (liveTrackerScopeSelect && settings.liveTrackerScope !== undefined) {
-                liveTrackerScopeSelect.value = settings.liveTrackerScope;
-                liveTrackerScope = liveTrackerScopeSelect.value || 'current';
+            if (liveTrackerScopeSelect && settingsState.liveTrackerScope !== undefined) {
+                liveTrackerScopeSelect.value = settingsState.liveTrackerScope;
             }
-            applySavedTimeframeSettings(settings);
+            applySavedTimeframeSettings(settingsState);
             const segmentNavigationModeSelect = document.getElementById('segmentNavigationModeSelect');
-            if (segmentNavigationModeSelect && settings.segmentNavigationMode !== undefined) {
-                segmentNavigationModeSelect.value = settings.segmentNavigationMode;
-                segmentNavigationMode = segmentNavigationModeSelect.value || 'travel';
+            if (segmentNavigationModeSelect && settingsState.segmentNavigationMode !== undefined) {
+                segmentNavigationModeSelect.value = settingsState.segmentNavigationMode;
             }
             updatePerformanceModeUi();
             updateLiveTrackerControlsUi();
@@ -625,11 +804,19 @@
             highlightedSegment = null;
         }
 
-        function getDrawerOcclusionHeight() {
+        function getDrawerOcclusionHeight(options = {}) {
+            const includeCollapsed = Boolean(options && options.includeCollapsed);
             const drawer = document.getElementById('segmentDrawer');
-            if (!drawer || !drawer.classList.contains('expanded')) {
+            if (!drawer) {
                 return 0;
             }
+
+            const isExpanded = drawer.classList.contains('expanded');
+            const isCollapsed = drawer.classList.contains('collapsed');
+            if (!isExpanded && !(includeCollapsed && isCollapsed)) {
+                return 0;
+            }
+
             const bounds = drawer.getBoundingClientRect();
             return Math.max(0, Math.round(bounds.height || 0));
         }
@@ -650,13 +837,15 @@
             map.fitBounds(bounds, mergedOptions);
         }
 
-        function setViewVisible(latLng, zoomLevel) {
+        function setViewVisible(latLng, zoomLevel, options = {}) {
             if (!map) {
                 return;
             }
 
             map.setView(latLng, zoomLevel);
-            const drawerOcclusion = getDrawerOcclusionHeight();
+            const drawerOcclusion = getDrawerOcclusionHeight({
+                includeCollapsed: Boolean(options && options.includeCollapsedDrawer),
+            });
             if (drawerOcclusion > 0) {
                 map.panBy([0, -Math.round(drawerOcclusion / 2)], { animate: false });
             }
@@ -679,6 +868,266 @@
                 startTime: Number.isFinite(segment.startTime) ? segment.startTime : null,
                 endTime: Number.isFinite(segment.endTime) ? segment.endTime : null,
             };
+        }
+
+        function getCurrentSelectedSegment() {
+            if (!selectedSegmentId || !Array.isArray(detectedSegments) || !detectedSegments.length) {
+                return null;
+            }
+            return detectedSegments.find((entry) => entry.id === selectedSegmentId) || null;
+        }
+
+        function getSegmentRawPoints(segment) {
+            return Array.isArray(segment && segment.rawPoints) ? segment.rawPoints.filter(Boolean) : [];
+        }
+
+        function setSegmentDebugStatus(message, isError = false) {
+            const statusElement = document.getElementById('segmentDebugStatus');
+            if (!statusElement) {
+                return;
+            }
+
+            statusElement.textContent = message || '';
+            statusElement.classList.toggle('error', Boolean(isError));
+
+            if (segmentDebugStatusTimer) {
+                clearTimeout(segmentDebugStatusTimer);
+                segmentDebugStatusTimer = null;
+            }
+
+            if (!message) {
+                return;
+            }
+
+            segmentDebugStatusTimer = setTimeout(() => {
+                if (statusElement.textContent === message) {
+                    statusElement.textContent = '';
+                    statusElement.classList.remove('error');
+                }
+            }, 2800);
+        }
+
+        function focusSelectedSegmentPoint(options = {}) {
+            const segment = getCurrentSelectedSegment();
+            const rawPoints = getSegmentRawPoints(segment);
+            if (!segment || !rawPoints.length) {
+                return;
+            }
+
+            selectedSegmentPointIndex = Math.max(0, Math.min(selectedSegmentPointIndex, rawPoints.length - 1));
+            const point = rawPoints[selectedSegmentPointIndex];
+            if (!point || !Number.isFinite(point.latitude) || !Number.isFinite(point.longitude)) {
+                return;
+            }
+
+            if (map && options.focusMap !== false) {
+                setViewVisible([point.latitude, point.longitude], Math.max(map.getZoom() || 0, 16), {
+                    includeCollapsedDrawer: true,
+                });
+            }
+
+            const marker = point.puid ? renderedPointMarkersById.get(point.puid) : null;
+            if (marker && marker.fire) {
+                marker.fire('click');
+                return;
+            }
+
+            if (map && L && L.popup) {
+                const popupContent = point.puid
+                    ? loadPopupContentforPoint(point.puid)
+                    : `<strong>${new Date(point.time).toLocaleString()}</strong><br>Latitude: ${point.latitude}<br>Longitude: ${point.longitude}`;
+                L.popup([point.latitude, point.longitude], {
+                    content: `<p>${popupContent}</p>`,
+                }).openOn(map);
+            }
+        }
+
+        function updateSegmentDebugControls() {
+            const prevPointButton = document.getElementById('prevSegmentPointBtn');
+            const nextPointButton = document.getElementById('nextSegmentPointBtn');
+            const pointCounter = document.getElementById('segmentPointCounter');
+            const pointTimestamp = document.getElementById('segmentPointTimestamp');
+            const copyPointButton = document.getElementById('copySegmentPointBtn');
+            const copyStopButton = document.getElementById('copySegmentStopBtn');
+            const copySegmentButton = document.getElementById('copySegmentDebugBtn');
+            if (!prevPointButton || !nextPointButton || !pointCounter || !pointTimestamp || !copyPointButton || !copyStopButton || !copySegmentButton) {
+                return;
+            }
+
+            const segment = getCurrentSelectedSegment();
+            const rawPoints = getSegmentRawPoints(segment);
+            const hasSegment = Boolean(segment);
+            const hasPoints = rawPoints.length > 0;
+
+            if (!hasPoints) {
+                selectedSegmentPointIndex = 0;
+                pointCounter.textContent = 'Point 0 / 0';
+                pointTimestamp.textContent = hasSegment ? 'No points on selected segment' : 'Select a segment';
+                prevPointButton.disabled = true;
+                nextPointButton.disabled = true;
+                copyPointButton.disabled = true;
+                copyStopButton.disabled = !(hasSegment && segment.type === 'stop');
+                copySegmentButton.disabled = !hasSegment;
+                return;
+            }
+
+            selectedSegmentPointIndex = Math.max(0, Math.min(selectedSegmentPointIndex, rawPoints.length - 1));
+            const activePoint = rawPoints[selectedSegmentPointIndex];
+            const activeTime = activePoint && activePoint.time ? new Date(activePoint.time) : null;
+
+            pointCounter.textContent = `Point ${selectedSegmentPointIndex + 1} / ${rawPoints.length}`;
+            pointTimestamp.textContent = activeTime && Number.isFinite(activeTime.getTime())
+                ? activeTime.toLocaleString()
+                : 'Point time unavailable';
+
+            prevPointButton.disabled = selectedSegmentPointIndex <= 0;
+            nextPointButton.disabled = selectedSegmentPointIndex >= rawPoints.length - 1;
+            copyPointButton.disabled = false;
+            copyStopButton.disabled = segment.type !== 'stop';
+            copySegmentButton.disabled = false;
+        }
+
+        function navigateSegmentPoint(direction) {
+            const segment = getCurrentSelectedSegment();
+            const rawPoints = getSegmentRawPoints(segment);
+            if (!segment || !rawPoints.length) {
+                setSegmentDebugStatus('No segment point available.', true);
+                return;
+            }
+
+            const nextIndex = selectedSegmentPointIndex + (direction > 0 ? 1 : -1);
+            selectedSegmentPointIndex = Math.max(0, Math.min(nextIndex, rawPoints.length - 1));
+            updateSegmentDebugControls();
+            focusSelectedSegmentPoint({ focusMap: true });
+        }
+
+        function distanceFromPointToCenterMeters(point, center) {
+            if (!point || !center) {
+                return null;
+            }
+            return calculateDistance(point.latitude, point.longitude, center.latitude, center.longitude, 'meters');
+        }
+
+        function buildCurrentSegmentDebugPayload() {
+            const segment = getCurrentSelectedSegment();
+            if (!segment) {
+                return null;
+            }
+
+            const rawPoints = getSegmentRawPoints(segment);
+            const activeIndex = Math.max(0, Math.min(selectedSegmentPointIndex, Math.max(0, rawPoints.length - 1)));
+            const activePoint = rawPoints.length ? rawPoints[activeIndex] : null;
+            const primaryCenter = Array.isArray(segment.centers) && segment.centers.length
+                ? segment.centers[0]
+                : (segment.center || null);
+
+            return {
+                segment: {
+                    id: segment.id || null,
+                    trackerId: segment.trackerId || null,
+                    type: segment.type || null,
+                    label: segment.label || null,
+                    startTimeMs: Number.isFinite(segment.startTime) ? segment.startTime : null,
+                    endTimeMs: Number.isFinite(segment.endTime) ? segment.endTime : null,
+                    startTimeIso: Number.isFinite(segment.startTime) ? new Date(segment.startTime).toISOString() : null,
+                    endTimeIso: Number.isFinite(segment.endTime) ? new Date(segment.endTime).toISOString() : null,
+                    pointCount: rawPoints.length,
+                    points: rawPoints.map((point, index) => ({
+                        index,
+                        puid: point && point.puid ? point.puid : null,
+                        time: point && point.time ? point.time : null,
+                        localTime: point && point.localTime ? point.localTime : null,
+                        latitude: point ? point.latitude : null,
+                        longitude: point ? point.longitude : null,
+                        velocity: point ? point.velocity : null,
+                        course: point ? point.course : null,
+                        gps_accuracy: point ? point.gps_accuracy : null,
+                        distanceToPrimaryStopCenterMeters: primaryCenter ? distanceFromPointToCenterMeters(point, primaryCenter) : null,
+                    })),
+                },
+                stop: {
+                    radiusMeters: getStopDetectionRadiusMeters(),
+                    center: segment.center || null,
+                    centers: Array.isArray(segment.centers) ? segment.centers : (segment.center ? [segment.center] : []),
+                },
+                point: activePoint ? {
+                    index: activeIndex,
+                    of: rawPoints.length,
+                    puid: activePoint.puid || null,
+                    time: activePoint.time || null,
+                    localTime: activePoint.localTime || null,
+                    latitude: activePoint.latitude,
+                    longitude: activePoint.longitude,
+                    velocity: activePoint.velocity,
+                    course: activePoint.course,
+                    gps_accuracy: activePoint.gps_accuracy,
+                    distanceToPrimaryStopCenterMeters: primaryCenter ? distanceFromPointToCenterMeters(activePoint, primaryCenter) : null,
+                } : null,
+            };
+        }
+
+        function copyTextToClipboard(text) {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                return navigator.clipboard.writeText(text);
+            }
+
+            return new Promise((resolve, reject) => {
+                try {
+                    const textArea = document.createElement('textarea');
+                    textArea.value = text;
+                    textArea.setAttribute('readonly', 'readonly');
+                    textArea.style.position = 'absolute';
+                    textArea.style.left = '-9999px';
+                    document.body.appendChild(textArea);
+                    textArea.select();
+                    const copied = document.execCommand('copy');
+                    document.body.removeChild(textArea);
+                    if (!copied) {
+                        reject(new Error('copy command failed'));
+                        return;
+                    }
+                    resolve();
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        }
+
+        async function copyCurrentSegmentDebugInfo(kind) {
+            const payload = buildCurrentSegmentDebugPayload();
+            if (!payload || !payload.segment) {
+                setSegmentDebugStatus('Select a segment first.', true);
+                return;
+            }
+
+            let valueToCopy = null;
+            if (kind === 'point') {
+                valueToCopy = payload.point;
+            } else if (kind === 'stop') {
+                if (payload.segment.type !== 'stop') {
+                    setSegmentDebugStatus('Selected segment is not a stop.', true);
+                    return;
+                }
+                valueToCopy = {
+                    segment: payload.segment,
+                    stop: payload.stop,
+                };
+            } else {
+                valueToCopy = payload;
+            }
+
+            if (!valueToCopy) {
+                setSegmentDebugStatus('No debug data available.', true);
+                return;
+            }
+
+            try {
+                await copyTextToClipboard(JSON.stringify(valueToCopy, null, 2));
+                setSegmentDebugStatus(`Copied ${kind} debug info.`);
+            } catch (err) {
+                console.warn('Unable to copy debug info', err);
+                setSegmentDebugStatus('Copy failed.', true);
+            }
         }
 
         function findBestSegmentMatch(context) {
@@ -728,6 +1177,77 @@
             return bestSegment;
         }
 
+        function isSameTrackPoint(leftPoint, rightPoint) {
+            if (!leftPoint || !rightPoint) {
+                return false;
+            }
+
+            if (leftPoint.puid && rightPoint.puid) {
+                return leftPoint.puid === rightPoint.puid;
+            }
+
+            return (
+                leftPoint.time === rightPoint.time &&
+                Number(leftPoint.latitude) === Number(rightPoint.latitude) &&
+                Number(leftPoint.longitude) === Number(rightPoint.longitude)
+            );
+        }
+
+        function getTravelRenderPoints(segment) {
+            const basePoints = Array.isArray(segment && segment.rawPoints) ? segment.rawPoints.filter(Boolean) : [];
+            if (!segment || segment.type !== 'travel' || !basePoints.length) {
+                return basePoints;
+            }
+
+            const timelineSegments = detectedSegments
+                .filter((entry) =>
+                    entry &&
+                    entry.trackerId === segment.trackerId &&
+                    (entry.type === 'travel' || entry.type === 'stop') &&
+                    Array.isArray(entry.rawPoints) &&
+                    entry.rawPoints.length
+                )
+                .sort((left, right) => {
+                    const leftStart = Number.isFinite(left.startTime) ? left.startTime : Number.POSITIVE_INFINITY;
+                    const rightStart = Number.isFinite(right.startTime) ? right.startTime : Number.POSITIVE_INFINITY;
+                    if (leftStart !== rightStart) {
+                        return leftStart - rightStart;
+                    }
+                    const leftEnd = Number.isFinite(left.endTime) ? left.endTime : Number.POSITIVE_INFINITY;
+                    const rightEnd = Number.isFinite(right.endTime) ? right.endTime : Number.POSITIVE_INFINITY;
+                    return leftEnd - rightEnd;
+                });
+
+            const currentIndex = timelineSegments.findIndex((entry) => entry.id === segment.id);
+            if (currentIndex < 0) {
+                return basePoints;
+            }
+
+            let renderPoints = basePoints.slice();
+            const previousSegment = timelineSegments[currentIndex - 1];
+            if (previousSegment && previousSegment.type === 'stop') {
+                const previousStopPoints = Array.isArray(previousSegment.rawPoints) ? previousSegment.rawPoints.filter(Boolean) : [];
+                if (previousStopPoints.length) {
+                    renderPoints = [previousStopPoints[previousStopPoints.length - 1]].concat(renderPoints);
+                }
+            }
+
+            const nextSegment = timelineSegments[currentIndex + 1];
+            if (nextSegment && nextSegment.type === 'stop') {
+                const nextStopPoints = Array.isArray(nextSegment.rawPoints) ? nextSegment.rawPoints.filter(Boolean) : [];
+                if (nextStopPoints.length) {
+                    renderPoints = renderPoints.concat(nextStopPoints[0]);
+                }
+            }
+
+            return renderPoints.reduce((accumulator, point) => {
+                if (!accumulator.length || !isSameTrackPoint(accumulator[accumulator.length - 1], point)) {
+                    accumulator.push(point);
+                }
+                return accumulator;
+            }, []);
+        }
+
         function highlightSegment(segmentId, options = {}) {
             const focusMap = options.focusMap !== false;
             clearSegmentHighlight();
@@ -735,12 +1255,17 @@
             if (!segment) {
                 return;
             }
+            const wasSameSegment = selectedSegmentId === segmentId;
             highlightedSegment = segmentId;
             selectedSegmentId = segmentId;
+            if (!wasSameSegment) {
+                selectedSegmentPointIndex = 0;
+            }
 
             if (segment.type === 'travel' && !segment.polyline && Array.isArray(segment.rawPoints) && segment.rawPoints.length >= 2) {
+                const travelRenderPoints = getTravelRenderPoints(segment);
                 const trackerColor = getTrackerColor(segment.trackerId);
-                segment.polyline = L.polyline(segment.rawPoints.map((point) => [point.latitude, point.longitude]), { color: trackerColor, weight: 2, opacity: 0.8 }).addTo(transitionGroup);
+                segment.polyline = L.polyline(travelRenderPoints.map((point) => [point.latitude, point.longitude]), { color: trackerColor, weight: 2, opacity: 0.8 }).addTo(transitionGroup);
                 segment.polyline._jpBaseStyle = { color: trackerColor, weight: 2, opacity: 0.8 };
                 segmentLayers.push(segment.polyline);
             }
@@ -860,6 +1385,7 @@
                 });
             }
             renderSegmentList();
+            updateSegmentDebugControls();
         }
 
         function restoreSelectedSegmentAfterRefresh(previousSegmentContext, preserveViewport) {
@@ -881,6 +1407,71 @@
             highlightSegment(matchedSegment.id, { focusMap: !preserveViewport });
         }
 
+        function formatSegmentTimeRange(startTime, endTime, options = {}) {
+            const startDate = startTime ? new Date(startTime) : null;
+            const endDate = endTime ? new Date(endTime) : null;
+
+            if (!startDate || !endDate || !Number.isFinite(startDate.getTime()) || !Number.isFinite(endDate.getTime())) {
+                return '';
+            }
+
+            const sameDay = startDate.toDateString() === endDate.toDateString();
+            const timeFormatter = new Intl.DateTimeFormat([], {
+                hour: 'numeric',
+                minute: '2-digit',
+            });
+            const datetimeFormatter = new Intl.DateTimeFormat([], {
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+            });
+            const dateOnlyFormatter = new Intl.DateTimeFormat([], {
+                month: 'short',
+                day: 'numeric',
+            });
+            const dateWithWeekdayFormatter = new Intl.DateTimeFormat([], {
+                weekday: 'short',
+                month: 'short',
+                day: 'numeric',
+            });
+            const nowDate = options.nowDate instanceof Date ? options.nowDate : new Date();
+            const startIsToday = Number.isFinite(nowDate.getTime()) && startDate.toDateString() === nowDate.toDateString();
+            const includeDateForNonToday = Boolean(options.includeDateForNonToday) && !startIsToday;
+            const includeWeekdayOnDesktop = Boolean(
+                options.includeWeekdayOnDesktop &&
+                typeof window !== 'undefined' &&
+                window.matchMedia &&
+                window.matchMedia('(min-width: 769px)').matches
+            );
+            const collapsedDateFormatter = includeWeekdayOnDesktop ? dateWithWeekdayFormatter : dateOnlyFormatter;
+
+            if (options.includeDate === false) {
+                return `${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
+            }
+
+            if (includeDateForNonToday) {
+                if (sameDay) {
+                    return `${collapsedDateFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
+                }
+                return `${collapsedDateFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${collapsedDateFormatter.format(endDate)} ${timeFormatter.format(endDate)}`;
+            }
+
+            if (options.includeDateOnlyIfMultiDay && sameDay) {
+                return `${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
+            }
+
+            if (options.includeDateOnlyIfMultiDay && !sameDay) {
+                return `${dateOnlyFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${dateOnlyFormatter.format(endDate)} ${timeFormatter.format(endDate)}`;
+            }
+
+            if (sameDay) {
+                return `${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
+            }
+
+            return `${datetimeFormatter.format(startDate)} – ${datetimeFormatter.format(endDate)}`;
+        }
+
         function updateSegmentNavigator() {
             const navigator = document.getElementById('segmentNavigator');
             const counter = document.getElementById('travelSegmentCounter');
@@ -895,6 +1486,7 @@
             if (!filteredSegments.length) {
                 navigator.style.display = 'none';
                 timeframe.textContent = 'No segment selected';
+                updateSegmentDebugControls();
                 return;
             }
 
@@ -903,21 +1495,28 @@
             const activeIndex = currentIndex >= 0 ? currentIndex : 0;
             const activeSegment = filteredSegments[activeIndex];
             const hasTimes = activeSegment && activeSegment.startTime && activeSegment.endTime;
+            const drawer = document.getElementById('segmentDrawer');
+            const isCollapsed = Boolean(drawer && drawer.classList.contains('collapsed'));
             if (hasTimes) {
-                const startTime = new Date(activeSegment.startTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-                const endTime = new Date(activeSegment.endTime).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-                timeframe.textContent = `${activeSegment.type === 'stop' ? 'Stop' : 'Travel'} • ${startTime} to ${endTime}`;
+                const formattedRange = formatSegmentTimeRange(activeSegment.startTime, activeSegment.endTime, {
+                    includeDate: isCollapsed,
+                    includeDateOnlyIfMultiDay: true,
+                    includeDateForNonToday: isCollapsed,
+                    includeWeekdayOnDesktop: isCollapsed,
+                });
+                timeframe.textContent = `${activeSegment.type === 'stop' ? 'Stop' : 'Travel'} • ${formattedRange || 'Time range unavailable'}`;
             } else {
                 timeframe.textContent = 'Time range unavailable';
             }
             counter.textContent = `${activeIndex + 1} / ${filteredSegments.length}`;
             prevButton.disabled = activeIndex <= 0;
             nextButton.disabled = activeIndex >= filteredSegments.length - 1;
+            updateSegmentDebugControls();
         }
 
         function getSegmentNavigationMode() {
             const modeSelect = document.getElementById('segmentNavigationModeSelect');
-            const selectedMode = modeSelect && modeSelect.value ? modeSelect.value : segmentNavigationMode;
+            const selectedMode = modeSelect && modeSelect.value ? modeSelect.value : settingsState.segmentNavigationMode;
             if (selectedMode === 'stops' || selectedMode === 'both') {
                 return selectedMode;
             }
@@ -942,7 +1541,7 @@
         }
 
         function onSegmentNavigationModeChanged() {
-            segmentNavigationMode = getSegmentNavigationMode();
+            settingsState.segmentNavigationMode = getSegmentNavigationMode();
             saveSettings();
             updateSegmentNavigator();
         }
@@ -982,12 +1581,46 @@
                 return accumulator;
             }, {});
 
+            const drawer = document.getElementById('segmentDrawer');
+            const isExpanded = Boolean(drawer && drawer.classList.contains('expanded'));
+
             container.innerHTML = Object.entries(groupedSegments).map(([trackerId, segments]) => {
                 const trackerLabel = trackerId === 'Unassigned' ? 'Unassigned' : trackerId;
                 const trackerColor = getTrackerColor(trackerId);
-                return `<div style='margin-bottom: 12px;'>
-                    <div style='font-weight: 600; color: ${trackerColor}; margin-bottom: 6px;'>${trackerLabel}</div>
-                    ${segments.map((segment) => {
+                const groupedByDate = isExpanded
+                    ? segments.reduce((groups, segment) => {
+                        const dateKey = segment && segment.startTime ? new Date(segment.startTime).toDateString() : 'unknown';
+                        if (!groups[dateKey]) {
+                            groups[dateKey] = [];
+                        }
+                        groups[dateKey].push(segment);
+                        return groups;
+                    }, {})
+                    : null;
+
+                const dateSections = isExpanded
+                    ? Object.entries(groupedByDate || {}).map(([dateKey, dateSegments]) => {
+                        const dateLabel = dateKey === 'unknown'
+                            ? 'Unknown date'
+                            : new Intl.DateTimeFormat([], { month: 'short', day: 'numeric', weekday: 'short' }).format(new Date(dateKey));
+                        return `<div style='margin-bottom: 10px;'>
+                            <div style='font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px;'>${dateLabel}</div>
+                            ${dateSegments.map((segment) => {
+                                const isSelected = selectedSegmentId === segment.id;
+                                const title = segment.type === 'stop' ? `Stop • ${segment.label}` : `Travel • ${segment.label}`;
+                                const count = Number.isFinite(segment.pointCount)
+                                    ? segment.pointCount
+                                    : (Array.isArray(segment.rawPoints) ? segment.rawPoints.length : 0);
+                                const pointCountText = `<div style='font-size: 11px; color: #64748b; margin-top: 2px;'>${count} point${count === 1 ? '' : 's'}</div>`;
+                                const timeText = segment.startTime && segment.endTime
+                                    ? `<div style='font-size: 11px; color: #666; margin-top: 4px;'>${formatSegmentTimeRange(segment.startTime, segment.endTime, { includeDate: false })}</div>`
+                                    : '';
+                                const selectedStyle = isSelected ? "border-color: #3388ff; background: #eef6ff; box-shadow: inset 0 0 0 1px #3388ff;" : "";
+                                return `<button class='segment-item ${isSelected ? 'selected' : ''}' onclick='highlightSegment("${segment.id}")' style='display: block; width: 100%; text-align: left; margin-bottom: 8px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; background: #fff; ${selectedStyle}'>${title}${pointCountText}${timeText}</button>`;
+                            }).join('')}
+                        </div>`;
+                    }).join('')
+                    : segments.map((segment) => {
                         const isSelected = selectedSegmentId === segment.id;
                         const title = segment.type === 'stop' ? `Stop • ${segment.label}` : `Travel • ${segment.label}`;
                         const count = Number.isFinite(segment.pointCount)
@@ -995,11 +1628,15 @@
                             : (Array.isArray(segment.rawPoints) ? segment.rawPoints.length : 0);
                         const pointCountText = `<div style='font-size: 11px; color: #64748b; margin-top: 2px;'>${count} point${count === 1 ? '' : 's'}</div>`;
                         const timeText = segment.startTime && segment.endTime
-                            ? `<div style='font-size: 11px; color: #666; margin-top: 4px;'>${new Date(segment.startTime).toLocaleString()} → ${new Date(segment.endTime).toLocaleString()}</div>`
+                            ? `<div style='font-size: 11px; color: #666; margin-top: 4px;'>${formatSegmentTimeRange(segment.startTime, segment.endTime, { includeDate: false })}</div>`
                             : '';
                         const selectedStyle = isSelected ? "border-color: #3388ff; background: #eef6ff; box-shadow: inset 0 0 0 1px #3388ff;" : "";
                         return `<button class='segment-item ${isSelected ? 'selected' : ''}' onclick='highlightSegment("${segment.id}")' style='display: block; width: 100%; text-align: left; margin-bottom: 8px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; background: #fff; ${selectedStyle}'>${title}${pointCountText}${timeText}</button>`;
-                    }).join('')}
+                    }).join('');
+
+                return `<div style='margin-bottom: 12px;'>
+                    <div style='font-weight: 600; color: ${trackerColor}; margin-bottom: 6px;'>${trackerLabel}</div>
+                    ${dateSections}
                 </div>`;
             }).join('');
             updateSegmentNavigator();
@@ -1009,6 +1646,7 @@
             const preserveViewport = Boolean(options && options.preserveViewport);
             const previousSelectedSegmentContext = getCurrentSelectedSegmentContext();
             linesGroup.clearLayers(); // Clear existing lines from the map
+            clearLiveTrackerExtensionLines();
             transitionGroup.clearLayers(); // Clear existing transition markers from the map
             renderedPointMarkersById = new Map();
             segmentLayers = [];
@@ -1019,6 +1657,14 @@
                 restoreSelectedSegmentAfterRefresh(previousSelectedSegmentContext, preserveViewport);
                 return; // No points to display
             }
+
+            let viewportBounds = null;
+            const extendViewportBounds = (bounds) => {
+                if (!bounds || !bounds.isValid || !bounds.isValid()) {
+                    return;
+                }
+                viewportBounds = viewportBounds ? viewportBounds.extend(bounds) : bounds;
+            };
 
             processSegments2(points);
             const stopPointIds = new Set();
@@ -1039,11 +1685,11 @@
             points.forEach((trackerPoints, trackerId) => {
                 const color = getTrackerColor(trackerId);
                 const trackerLinePoints = Array.from(trackerPoints.values()).filter((p) => {
-                    if (showIndividualPoints) {
+                    if (settingsState.showIndividualPoints) {
                         return true;
                     }
                     return !stopPointIds.has(p.puid);
-                });
+                }).sort((left, right) => new Date(left.time) - new Date(right.time));
 
                 const trackerTravelSegments = detectedSegments.filter((segment) =>
                     segment &&
@@ -1054,20 +1700,21 @@
                 );
 
                 var polyline = null;
-                if (showIndividualPoints && trackerLinePoints.length >= 2) {
+                if (settingsState.showIndividualPoints && trackerLinePoints.length >= 2) {
                     polyline = L.polyline(trackerLinePoints.map((p) => [p.latitude, p.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
                     polyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
                     segmentLayers.push(polyline);
                     if (!preserveViewport && polyline.getBounds) {
-                        fitBoundsVisible(polyline.getBounds(), {
-                            paddingTopLeft: [20, 20],
-                            paddingBottomRight: [20, 20 + getDrawerOcclusionHeight()],
-                        });
+                        extendViewportBounds(polyline.getBounds());
                     }
-                } else if (!showIndividualPoints && trackerTravelSegments.length) {
+                } else if (!settingsState.showIndividualPoints && trackerTravelSegments.length) {
                     const segmentPolylines = [];
                     trackerTravelSegments.forEach((segment) => {
-                        const segmentPolyline = L.polyline(segment.rawPoints.map((point) => [point.latitude, point.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
+                        const travelRenderPoints = getTravelRenderPoints(segment);
+                        if (travelRenderPoints.length < 2) {
+                            return;
+                        }
+                        const segmentPolyline = L.polyline(travelRenderPoints.map((point) => [point.latitude, point.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
                         segmentPolyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
                         segmentLayers.push(segmentPolyline);
                         segmentPolylines.push(segmentPolyline);
@@ -1075,31 +1722,27 @@
 
                     if (!preserveViewport && segmentPolylines.length) {
                         const segmentGroup = L.featureGroup(segmentPolylines);
-                        fitBoundsVisible(segmentGroup.getBounds(), {
-                            paddingTopLeft: [20, 20],
-                            paddingBottomRight: [20, 20 + getDrawerOcclusionHeight()],
-                        });
+                        extendViewportBounds(segmentGroup.getBounds());
                     }
 
                     polyline = segmentPolylines.length === 1
                         ? segmentPolylines[0]
                         : (segmentPolylines.length ? L.featureGroup(segmentPolylines) : null);
+                } else if (!settingsState.showIndividualPoints && trackerLinePoints.length >= 2) {
+                    // Fallback for sparse/transition states where travel segmentation has not yielded drawable segments yet.
+                    polyline = L.polyline(trackerLinePoints.map((point) => [point.latitude, point.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
+                    polyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
+                    segmentLayers.push(polyline);
+                    if (!preserveViewport && polyline.getBounds) {
+                        extendViewportBounds(polyline.getBounds());
+                    }
                 }
 
-                detectedSegments.push({
-                    id: `track-${detectedSegments.length + 1}`,
-                    trackerId: trackerId,
-                    type: 'travel',
-                    label: trackerId || 'Tracker',
-                    pointCount: showIndividualPoints
-                        ? trackerLinePoints.length
-                        : trackerTravelSegments.reduce((count, segment) => count + segment.rawPoints.length, 0),
-                    points: [],
-                    polyline: polyline,
-                });
+                // Keep detectedSegments limited to true stop/travel segments produced by processSegments2.
+                // Synthetic per-tracker line summaries caused empty debug payloads like track-* with null times.
             });
 
-            if (showIndividualPoints) {
+            if (settingsState.showIndividualPoints) {
                 points.forEach((trackerPoints, trackerId) => {
                     const color = getTrackerColor(trackerId);
                     trackerPoints.forEach(function(point) {
@@ -1136,7 +1779,14 @@
                 });
             }
 
-            refreshLiveMarkers();
+            if (!preserveViewport && viewportBounds && viewportBounds.isValid && viewportBounds.isValid()) {
+                fitBoundsVisible(viewportBounds, {
+                    paddingTopLeft: [20, 20],
+                    paddingBottomRight: [20, 20 + getDrawerOcclusionHeight()],
+                });
+            }
+
+            refreshLiveMarkers({ mergeIntoTrackLines: false });
 
             restoreSelectedSegmentAfterRefresh(previousSelectedSegmentContext, preserveViewport);
         }
@@ -1167,7 +1817,71 @@
 
         }
 
-        function loadTrackersAndPoints(options = {}) {
+        function getEffectivePointsTimeRange() {
+            const picker = $('input[name="datetimes"]').data('daterangepicker');
+            if (!picker || !picker.startDate || !picker.endDate) {
+                return null;
+            }
+
+            let startDate = picker.startDate.clone();
+            let endDate = picker.endDate.clone();
+
+            if (isAllTrackersSelected()) {
+                const maxSpanMs = 24 * 60 * 60 * 1000;
+                const requestedSpanMs = Math.max(0, endDate.valueOf() - startDate.valueOf());
+                if (requestedSpanMs > maxSpanMs) {
+                    endDate = endDate.clone();
+                    startDate = endDate.clone().subtract(maxSpanMs, 'milliseconds');
+                    picker.setStartDate(startDate);
+                    picker.setEndDate(endDate);
+                }
+            }
+
+            return {
+                startDate,
+                endDate,
+            };
+        }
+
+        function beginPendingPointsRequest() {
+            if (!pendingPointsRequest) {
+                return;
+            }
+
+            const request = pendingPointsRequest;
+            pendingPointsRequest = null;
+            loadTrackersAndPoints(request.options, request.requestToken);
+        }
+
+        function clearPointsRequestTimeout() {
+            if (pointsRequestTimeoutTimer) {
+                clearTimeout(pointsRequestTimeoutTimer);
+                pointsRequestTimeoutTimer = null;
+            }
+        }
+
+        function abortActivePointsRequest() {
+            if (!pointsRequestInFlight) {
+                return;
+            }
+
+            clearPointsRequestTimeout();
+            pointsRequestInFlight.abort();
+            pointsRequestInFlight = null;
+        }
+
+        function loadTrackersAndPoints(options = {}, requestToken = null) {
+            if (!requestToken) {
+                pointsRequestSequence += 1;
+                requestToken = pointsRequestSequence;
+            }
+
+            const shouldQueueRequest = Boolean(pointsRequestInFlight);
+            if (shouldQueueRequest) {
+                pendingPointsRequest = { options, requestToken };
+                return;
+            }
+
             saveSettings({ source: 'auto' });
             if (!options || options.evaluateFollowMode !== false) {
                 activeSearchFollowsNow = doesActiveSearchEndNow();
@@ -1176,8 +1890,36 @@
                 syncPickerRangeToNowPreservingWindow();
                 activeSearchFollowsNow = true;
             }
+
+            const effectiveRange = getEffectivePointsTimeRange();
+            const startTimeSeconds = effectiveRange && effectiveRange.startDate
+                ? effectiveRange.startDate.toDate().getTime() / 1000
+                : 0;
+            const endTimeSeconds = effectiveRange && effectiveRange.endDate
+                ? effectiveRange.endDate.toDate().getTime() / 1000
+                : 0;
+
             const xhttp = new XMLHttpRequest();
+            pointsRequestInFlight = xhttp;
+            clearPointsRequestTimeout();
+            pointsRequestTimeoutTimer = setTimeout(() => {
+                if (pointsRequestInFlight !== xhttp) {
+                    return;
+                }
+                console.warn('Points request timed out; aborting request.');
+                window.alert('The points request took too long and was cancelled. Please try again.');
+                abortActivePointsRequest();
+                if (pendingPointsRequest) {
+                    beginPendingPointsRequest();
+                }
+            }, pointsRequestTimeoutMs);
+
             xhttp.onload = function() {
+                clearPointsRequestTimeout();
+                if (pointsRequestInFlight !== xhttp) {
+                    return;
+                }
+                pointsRequestInFlight = null;
                 try {
                     const response = JSON.parse(this.responseText);
                     const trackerGroups = Array.isArray(response.trackers) ? response.trackers : [];
@@ -1196,10 +1938,38 @@
                         isHydratingStartupSettings = false;
                     }
                 }
-            }
-            // Get the selected tracker ID from the query or the dropdown
-            var selectedTrackerId = getCurrentSelectedTrackerId() || "all_trackers";
-            xhttp.open("GET", "/points?tracker_id=" + encodeURIComponent(selectedTrackerId) + "&seconds_start=" + $('input[name="datetimes"]').data('daterangepicker').startDate.toDate().getTime()/1000 + "&seconds_end=" + $('input[name="datetimes"]').data('daterangepicker').endDate.toDate().getTime()/1000, true);
+
+                if (pendingPointsRequest) {
+                    beginPendingPointsRequest();
+                }
+            };
+
+            xhttp.onerror = function() {
+                clearPointsRequestTimeout();
+                if (pointsRequestInFlight !== xhttp) {
+                    return;
+                }
+                pointsRequestInFlight = null;
+                console.error('Points request failed.');
+                if (pendingPointsRequest) {
+                    beginPendingPointsRequest();
+                }
+            };
+
+            xhttp.onabort = function() {
+                clearPointsRequestTimeout();
+                if (pointsRequestInFlight !== xhttp) {
+                    return;
+                }
+                pointsRequestInFlight = null;
+                console.warn('Points request was aborted.');
+                if (pendingPointsRequest) {
+                    beginPendingPointsRequest();
+                }
+            };
+
+            const selectedTrackerId = getCurrentSelectedTrackerId() || "all_trackers";
+            xhttp.open("GET", "/points?tracker_id=" + encodeURIComponent(selectedTrackerId) + "&seconds_start=" + startTimeSeconds + "&seconds_end=" + endTimeSeconds, true);
             xhttp.send();
         }
 
@@ -1209,30 +1979,50 @@
         }
 
         function getStopDetectionRadiusMeters() {
+            const stateValue = Number(settingsState.stopDetectionRadiusMeters);
+            if (Number.isFinite(stateValue) && stateValue > 0) {
+                return stateValue;
+            }
             const input = document.getElementById("stopDetectionRadiusInput");
             const value = parseFloat(input && input.value);
             return Number.isFinite(value) && value > 0 ? value : stopDetectionRadiusMeters;
         }
 
         function getStopDetectionMinSeconds() {
+            const stateValue = Number(settingsState.stopDetectionMinSeconds);
+            if (Number.isFinite(stateValue) && stateValue > 0) {
+                return stateValue;
+            }
             const input = document.getElementById("stopDetectionMinSecondsInput");
             const value = parseInt(input && input.value, 10);
             return Number.isFinite(value) && value > 0 ? value : stopDetectionMinSeconds;
         }
 
         function getStopDetectionWindowPoints() {
+            const stateValue = Number(settingsState.stopDetectionWindowPoints);
+            if (Number.isFinite(stateValue) && stateValue > 0) {
+                return stateValue;
+            }
             const input = document.getElementById("stopDetectionWindowPointsInput");
             const value = parseInt(input && input.value, 10);
             return Number.isFinite(value) && value > 0 ? value : stopDetectionWindowPoints;
         }
 
         function getStopDetectionExitPoints() {
+            const stateValue = Number(settingsState.stopDetectionExitPoints);
+            if (Number.isFinite(stateValue) && stateValue > 0) {
+                return stateValue;
+            }
             const input = document.getElementById("stopDetectionExitPointsInput");
             const value = parseInt(input && input.value, 10);
             return Number.isFinite(value) && value > 0 ? value : stopDetectionExitPoints;
         }
 
         function getStopDetectionSampleIntervalSeconds() {
+            const stateValue = Number(settingsState.stopDetectionSampleIntervalSeconds);
+            if (Number.isFinite(stateValue) && stateValue > 0) {
+                return stateValue;
+            }
             const input = document.getElementById("stopDetectionSampleIntervalSecondsInput");
             const value = parseInt(input && input.value, 10);
             return Number.isFinite(value) && value > 0 ? value : stopDetectionSampleIntervalSeconds;
@@ -1384,6 +2174,130 @@
                     });
                 };
 
+                const clampNumber = (value, min, max) => {
+                    if (!Number.isFinite(value)) {
+                        return min;
+                    }
+                    return Math.min(max, Math.max(min, value));
+                };
+
+                const getPointDistanceFromCenter = (point, center) => {
+                    if (!point || !center) {
+                        return null;
+                    }
+                    return calculateDistance(point.latitude, point.longitude, center.latitude, center.longitude, 'meters');
+                };
+
+                const computeAverageRadialSpeed = (center, pointsList, direction) => {
+                    if (!center || !Array.isArray(pointsList) || pointsList.length < 2) {
+                        return null;
+                    }
+
+                    const radialSpeeds = [];
+                    for (let index = 1; index < pointsList.length; index++) {
+                        const previousPoint = pointsList[index - 1];
+                        const currentPoint = pointsList[index];
+                        const previousTime = getPointTime(previousPoint);
+                        const currentTime = getPointTime(currentPoint);
+                        if (previousTime === null || currentTime === null || currentTime <= previousTime) {
+                            continue;
+                        }
+
+                        const previousDistance = getPointDistanceFromCenter(previousPoint, center);
+                        const currentDistance = getPointDistanceFromCenter(currentPoint, center);
+                        if (!Number.isFinite(previousDistance) || !Number.isFinite(currentDistance)) {
+                            continue;
+                        }
+
+                        const radialDelta = currentDistance - previousDistance;
+                        const deltaSeconds = (currentTime - previousTime) / 1000;
+                        if (deltaSeconds <= 0) {
+                            continue;
+                        }
+
+                        if (direction === 'outbound' && radialDelta > 0) {
+                            radialSpeeds.push(radialDelta / deltaSeconds);
+                        }
+                        if (direction === 'inbound' && radialDelta < 0) {
+                            radialSpeeds.push(Math.abs(radialDelta) / deltaSeconds);
+                        }
+                    }
+
+                    if (!radialSpeeds.length) {
+                        return null;
+                    }
+
+                    return radialSpeeds.reduce((sum, speed) => sum + speed, 0) / radialSpeeds.length;
+                };
+
+                const estimateBoundaryCrossingTime = (center, insidePoint, outsidePoints, direction) => {
+                    const insideTime = getPointTime(insidePoint);
+                    if (!center || !insidePoint || insideTime === null) {
+                        return insideTime;
+                    }
+
+                    const insideDistance = getPointDistanceFromCenter(insidePoint, center);
+                    if (!Number.isFinite(insideDistance)) {
+                        return insideTime;
+                    }
+
+                    const candidates = (Array.isArray(outsidePoints) ? outsidePoints : []).filter((point) => getPointTime(point) !== null);
+                    if (!candidates.length) {
+                        return insideTime;
+                    }
+
+                    const boundaryReferencePoints = direction === 'outbound'
+                        ? candidates.slice(0, Math.max(1, exitPoints))
+                        : candidates.slice(Math.max(0, candidates.length - Math.max(1, exitPoints)));
+
+                    const speedSeries = direction === 'outbound'
+                        ? [insidePoint].concat(boundaryReferencePoints)
+                        : boundaryReferencePoints.concat([insidePoint]);
+                    const averageRadialSpeed = computeAverageRadialSpeed(center, speedSeries, direction);
+
+                    const distanceToRadius = Math.max(0, radiusMeters - insideDistance);
+                    let estimatedCrossingTime = null;
+
+                    if (Number.isFinite(averageRadialSpeed) && averageRadialSpeed > 0 && distanceToRadius > 0) {
+                        const crossingDeltaMs = (distanceToRadius / averageRadialSpeed) * 1000;
+                        estimatedCrossingTime = direction === 'outbound'
+                            ? insideTime + crossingDeltaMs
+                            : insideTime - crossingDeltaMs;
+                    }
+
+                    const nearestOutsidePoint = direction === 'outbound'
+                        ? boundaryReferencePoints[0]
+                        : boundaryReferencePoints[boundaryReferencePoints.length - 1];
+                    const nearestOutsideTime = getPointTime(nearestOutsidePoint);
+                    const nearestOutsideDistance = getPointDistanceFromCenter(nearestOutsidePoint, center);
+
+                    if (
+                        !Number.isFinite(estimatedCrossingTime) &&
+                        nearestOutsideTime !== null &&
+                        Number.isFinite(nearestOutsideDistance) &&
+                        Math.abs(nearestOutsideDistance - insideDistance) > 0.001
+                    ) {
+                        const interpolationRatio = clampNumber(
+                            (radiusMeters - insideDistance) / (nearestOutsideDistance - insideDistance),
+                            0,
+                            1
+                        );
+                        estimatedCrossingTime = insideTime + ((nearestOutsideTime - insideTime) * interpolationRatio);
+                    }
+
+                    if (!Number.isFinite(estimatedCrossingTime)) {
+                        return insideTime;
+                    }
+
+                    if (nearestOutsideTime !== null) {
+                        const minBound = Math.min(insideTime, nearestOutsideTime);
+                        const maxBound = Math.max(insideTime, nearestOutsideTime);
+                        estimatedCrossingTime = clampNumber(estimatedCrossingTime, minBound, maxBound);
+                    }
+
+                    return estimatedCrossingTime;
+                };
+
                 const canMergeStopBridge = (leftStop, bridgeSegment, rightStop) => {
                     if (!leftStop || !bridgeSegment || !rightStop) {
                         return false;
@@ -1441,6 +2355,117 @@
                     return mergedSegments;
                 };
 
+                const getSegmentPoints = (segment) => {
+                    return Array.isArray(segment && segment.rawPoints) ? segment.rawPoints.filter(Boolean) : [];
+                };
+
+                const syncSegmentFromPoints = (segment) => {
+                    if (!segment) {
+                        return;
+                    }
+
+                    const segmentPoints = getSegmentPoints(segment);
+                    segment.rawPoints = segmentPoints;
+                    segment.pointCount = segmentPoints.length;
+
+                    if (!segmentPoints.length) {
+                        segment.startTime = null;
+                        segment.endTime = null;
+                        return;
+                    }
+
+                    const firstPointTime = getPointTime(segmentPoints[0]);
+                    const lastPointTime = getPointTime(segmentPoints[segmentPoints.length - 1]);
+                    if (firstPointTime !== null) {
+                        segment.startTime = firstPointTime;
+                    }
+                    if (lastPointTime !== null) {
+                        segment.endTime = lastPointTime;
+                    }
+                };
+
+                const pointWithinAnyCenter = (point, centers) => {
+                    return (Array.isArray(centers) ? centers : []).some((center) => isPointWithinCenterRadius(point, center));
+                };
+
+                const absorbStopRadiusBoundaryPoints = (segmentsList) => {
+                    const normalizedSegments = (Array.isArray(segmentsList) ? segmentsList : []).map((segment) => ({
+                        ...segment,
+                        rawPoints: Array.isArray(segment.rawPoints) ? segment.rawPoints.slice() : [],
+                        centers: Array.isArray(segment.centers) ? segment.centers.slice() : [],
+                    }));
+
+                    for (let index = 0; index < normalizedSegments.length - 1; index++) {
+                        const leftSegment = normalizedSegments[index];
+                        const rightSegment = normalizedSegments[index + 1];
+                        if (!leftSegment || !rightSegment) {
+                            continue;
+                        }
+
+                        if (leftSegment.type === 'stop' && rightSegment.type === 'travel') {
+                            const stopCenters = dedupeCenters([
+                                ...(Array.isArray(leftSegment.centers) ? leftSegment.centers : []),
+                                ...(leftSegment.center ? [leftSegment.center] : []),
+                            ]);
+                            if (!stopCenters.length) {
+                                continue;
+                            }
+
+                            const travelPoints = getSegmentPoints(rightSegment);
+                            if (travelPoints.length <= 2) {
+                                continue;
+                            }
+
+                            const maxAbsorbCount = Math.max(0, travelPoints.length - 2);
+                            let absorbCount = 0;
+                            while (absorbCount < maxAbsorbCount && pointWithinAnyCenter(travelPoints[absorbCount], stopCenters)) {
+                                absorbCount += 1;
+                            }
+
+                            if (absorbCount > 0) {
+                                leftSegment.rawPoints = getSegmentPoints(leftSegment).concat(travelPoints.slice(0, absorbCount));
+                                rightSegment.rawPoints = travelPoints.slice(absorbCount);
+                                syncSegmentFromPoints(leftSegment);
+                                syncSegmentFromPoints(rightSegment);
+                            }
+                        }
+
+                        if (leftSegment.type === 'travel' && rightSegment.type === 'stop') {
+                            const stopCenters = dedupeCenters([
+                                ...(Array.isArray(rightSegment.centers) ? rightSegment.centers : []),
+                                ...(rightSegment.center ? [rightSegment.center] : []),
+                            ]);
+                            if (!stopCenters.length) {
+                                continue;
+                            }
+
+                            const travelPoints = getSegmentPoints(leftSegment);
+                            if (travelPoints.length <= 2) {
+                                continue;
+                            }
+
+                            const maxAbsorbCount = Math.max(0, travelPoints.length - 2);
+                            let absorbCount = 0;
+                            while (
+                                absorbCount < maxAbsorbCount &&
+                                pointWithinAnyCenter(travelPoints[travelPoints.length - 1 - absorbCount], stopCenters)
+                            ) {
+                                absorbCount += 1;
+                            }
+
+                            if (absorbCount > 0) {
+                                const splitIndex = travelPoints.length - absorbCount;
+                                leftSegment.rawPoints = travelPoints.slice(0, splitIndex);
+                                rightSegment.rawPoints = travelPoints.slice(splitIndex).concat(getSegmentPoints(rightSegment));
+                                syncSegmentFromPoints(leftSegment);
+                                syncSegmentFromPoints(rightSegment);
+                            }
+                        }
+                    }
+
+                    return normalizedSegments.filter((segment) => getSegmentPoints(segment).length > 0);
+                };
+
                 const renderSegment = (segment) => {
                     if (!segment || !Array.isArray(segment.rawPoints) || !segment.rawPoints.length) {
                         return;
@@ -1473,6 +2498,8 @@
                 let stopPoints = [];
                 let stopCenter = null;
                 let pendingExitPoints = [];
+                let movingStartBoundaryTime = null;
+                let stopStartBoundaryTime = null;
 
                 const pushMovingPoint = (point) => {
                     if (!point) {
@@ -1503,6 +2530,11 @@
 
                         if (candidateStopPoints.length >= entryPoints && candidateState.valid && candidateDurationSeconds >= minSeconds) {
                             const stopEntryPoint = candidateStopPoints[0] || null;
+                            const inboundOutsidePoints = movingPoints.slice(Math.max(0, movingPoints.length - Math.max(1, exitPoints)));
+                            const entryBoundaryTime = stopEntryPoint
+                                ? estimateBoundaryCrossingTime(candidateState.center, stopEntryPoint, inboundOutsidePoints, 'inbound')
+                                : pointTime;
+
                             if (movingPoints.length) {
                                 const movingSegmentPoints = stopEntryPoint
                                     ? movingPoints.concat(stopEntryPoint)
@@ -1510,13 +2542,15 @@
                                 finalizeSegment(
                                     Mode.MOVING,
                                     movingSegmentPoints,
-                                    getPointTime(movingSegmentPoints[0]),
-                                    getPointTime(movingSegmentPoints[movingSegmentPoints.length - 1])
+                                    Number.isFinite(movingStartBoundaryTime) ? movingStartBoundaryTime : getPointTime(movingSegmentPoints[0]),
+                                    Number.isFinite(entryBoundaryTime) ? entryBoundaryTime : getPointTime(movingSegmentPoints[movingSegmentPoints.length - 1])
                                 );
+                                movingStartBoundaryTime = null;
                             }
 
                             stopPoints = candidateStopPoints.slice();
                             stopCenter = candidateState.center;
+                            stopStartBoundaryTime = entryBoundaryTime;
                             candidateStopPoints = [];
                             pendingExitPoints = [];
                             currentMode = Mode.STOP;
@@ -1560,24 +2594,35 @@
                     }
 
                     if (stopPoints.length) {
+                        const finalizedStopCenter = stopCenter || analyzeCluster(stopPoints).center;
                         const stopExitPoint = stopPoints[stopPoints.length - 1] || null;
+                        const stopCorePoints = stopPoints.length > 2
+                            ? stopPoints.slice(1, -1)
+                            : [];
+                        const exitBoundaryTime = stopExitPoint
+                            ? estimateBoundaryCrossingTime(finalizedStopCenter, stopExitPoint, pendingExitPoints, 'outbound')
+                            : getPointTime(pendingExitPoints[0]);
+
                         finalizeSegment(
                             Mode.STOP,
-                            stopPoints,
-                            getPointTime(stopPoints[0]),
-                            getPointTime(stopPoints[stopPoints.length - 1]),
-                            stopCenter || analyzeCluster(stopPoints).center
+                            stopCorePoints,
+                            Number.isFinite(stopStartBoundaryTime) ? stopStartBoundaryTime : getPointTime(stopPoints[0]),
+                            Number.isFinite(exitBoundaryTime) ? exitBoundaryTime : getPointTime(stopPoints[stopPoints.length - 1]),
+                            finalizedStopCenter
                         );
 
                         movingPoints = stopExitPoint
                             ? [stopExitPoint].concat(pendingExitPoints)
                             : pendingExitPoints.slice();
+                        movingStartBoundaryTime = exitBoundaryTime;
                     } else {
                         movingPoints = pendingExitPoints.slice();
+                        movingStartBoundaryTime = null;
                     }
                     candidateStopPoints = [];
                     stopPoints = [];
                     stopCenter = null;
+                    stopStartBoundaryTime = null;
                     pendingExitPoints = [];
                     currentMode = Mode.MOVING;
                 });
@@ -1585,14 +2630,25 @@
                 if (currentMode === Mode.STOP) {
                     const trailingStopPoints = stopPoints.concat(pendingExitPoints);
                     const trailingStopState = analyzeCluster(trailingStopPoints);
+                    const finalizedStopPoints = trailingStopState.valid
+                        ? trailingStopPoints
+                        : stopPoints;
+                    const finalizedStopCenter = trailingStopState.valid
+                        ? trailingStopState.center
+                        : stopCenter;
+                    const stopCorePoints = finalizedStopPoints.length > 2
+                        ? finalizedStopPoints.slice(1, -1)
+                        : [];
+
                     finalizeSegment(
                         Mode.STOP,
-                        trailingStopPoints,
-                        getPointTime(trailingStopPoints[0]),
-                        getPointTime(trailingStopPoints[trailingStopPoints.length - 1]),
-                        trailingStopState.valid ? trailingStopState.center : stopCenter
+                        stopCorePoints,
+                        Number.isFinite(stopStartBoundaryTime) ? stopStartBoundaryTime : getPointTime(finalizedStopPoints[0]),
+                        getPointTime(finalizedStopPoints[finalizedStopPoints.length - 1]),
+                        finalizedStopCenter
                     );
-                    (allTrackersSelected ? rawSegments : mergeStopBridgeSegments(rawSegments)).forEach(renderSegment);
+                    const boundaryNormalizedSegments = absorbStopRadiusBoundaryPoints(rawSegments);
+                    (allTrackersSelected ? boundaryNormalizedSegments : mergeStopBridgeSegments(boundaryNormalizedSegments)).forEach(renderSegment);
                     return;
                 }
 
@@ -1600,11 +2656,12 @@
                 finalizeSegment(
                     Mode.MOVING,
                     trailingMovingPoints,
-                    getPointTime(trailingMovingPoints[0]),
+                    Number.isFinite(movingStartBoundaryTime) ? movingStartBoundaryTime : getPointTime(trailingMovingPoints[0]),
                     getPointTime(trailingMovingPoints[trailingMovingPoints.length - 1])
                 );
 
-                (allTrackersSelected ? rawSegments : mergeStopBridgeSegments(rawSegments)).forEach(renderSegment);
+                const boundaryNormalizedSegments = absorbStopRadiusBoundaryPoints(rawSegments);
+                (allTrackersSelected ? boundaryNormalizedSegments : mergeStopBridgeSegments(boundaryNormalizedSegments)).forEach(renderSegment);
             });
         }
 
@@ -1724,7 +2781,7 @@
                 return;
             }
 
-            const liveScopeLabel = liveTrackerScope === 'all' ? 'All trackers in DB' : 'Current tracker only';
+            const liveScopeLabel = settingsState.liveTrackerScope === 'all' ? 'All trackers in DB' : 'Current tracker only';
             const liveRefreshLabel = isAutoMqttUpdateEnabled() ? 'Live markers refreshing' : 'Live markers off';
             const selectedTrackerId = getCurrentSelectedTrackerId();
             const performanceModeLabel = isAllTrackersSelected() ? 'Active (all trackers selected)' : 'Inactive';
@@ -2151,7 +3208,7 @@
                 return;
             }
 
-            activeSearchFollowsNow = doesActiveSearchEndNow();
+            activeSearchFollowsNow = shouldFollowTimeframeNow();
             fetchTrackersCatalog();
             if (activeSearchFollowsNow) {
                 loadTrackersAndPoints({ preserveViewport: true, followNow: true, evaluateFollowMode: false });
@@ -2163,6 +3220,7 @@
                 if (!map || !linesGroup || !transitionGroup) {
                     return;
                 }
+                activeSearchFollowsNow = shouldFollowTimeframeNow();
                 fetchTrackersCatalog();
                 if (activeSearchFollowsNow) {
                     loadTrackersAndPoints({ preserveViewport: true, followNow: true, evaluateFollowMode: false });
@@ -2173,6 +3231,10 @@
         }
 
         function getManualMqttIntervalSeconds() {
+            const stateValue = Number(settingsState.manualMqttIntervalSeconds);
+            if (Number.isFinite(stateValue) && stateValue >= 0) {
+                return stateValue;
+            }
             const select = document.getElementById('manualMqttIntervalSelect');
             const intervalSeconds = parseInt(select && select.value, 10);
             return Number.isFinite(intervalSeconds) ? intervalSeconds : 0;
@@ -2797,6 +3859,8 @@
             backdrop-filter: blur(4px);
             transition: height 180ms ease;
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
         .segment-drawer.collapsed {
             height: 86px;
@@ -2866,7 +3930,8 @@
         }
         .segment-drawer-body {
             padding: 0 12px 12px;
-            max-height: calc(min(72vh, 560px) - 56px - 30px);
+            flex: 1 1 auto;
+            min-height: 0;
             overflow: auto;
             display: block;
         }
@@ -2886,8 +3951,61 @@
             line-height: 1.2;
             margin-top: 2px;
         }
+        .segment-debug-controls {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 6px;
+            width: 100%;
+            margin-top: 2px;
+        }
+        .segment-debug-controls button {
+            border: 1px solid #d0d7de;
+            border-radius: 6px;
+            background: #fff;
+            color: #1f2937;
+            font-size: 11px;
+            font-weight: 600;
+            min-height: 26px;
+            padding: 2px 8px;
+            cursor: pointer;
+        }
+        .segment-debug-controls button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .segment-point-counter {
+            font-size: 11px;
+            color: #475569;
+            min-width: 80px;
+            text-align: center;
+            font-variant-numeric: tabular-nums;
+        }
+        .segment-point-time {
+            width: 100%;
+            text-align: center;
+            font-size: 11px;
+            color: #64748b;
+            line-height: 1.2;
+        }
+        .segment-debug-status {
+            width: 100%;
+            min-height: 14px;
+            text-align: center;
+            font-size: 11px;
+            color: #1d4ed8;
+            line-height: 1.2;
+        }
+        .segment-debug-status.error {
+            color: #b91c1c;
+        }
         .segment-drawer.collapsed .segment-nav {
             margin-bottom: 0;
+        }
+        .segment-drawer.collapsed .segment-debug-controls,
+        .segment-drawer.collapsed .segment-debug-status {
+            display: none;
         }
         @media (max-width: 900px) {
             #settingsToggleBtn {
@@ -2916,6 +4034,7 @@
                 grid-template-areas:
                     "mode nav toggle"
                     "time time time"
+                    "debug debug debug"
                     "grabber grabber grabber";
                 align-items: center;
                 justify-items: center;
@@ -2946,15 +4065,16 @@
                 text-align: center;
                 margin-top: 0;
             }
+            .segment-debug-controls {
+                grid-area: debug;
+                margin-top: 0;
+            }
             .segment-drawer-grabber {
                 grid-area: grabber;
                 margin-top: 0;
             }
             .segment-drawer.expanded {
                 height: min(78vh, 620px);
-            }
-            .segment-drawer-body {
-                max-height: calc(min(78vh, 620px) - 56px - 30px);
             }
         }
     </style>
@@ -3044,7 +4164,7 @@
                         <input id="stopDetectionSampleIntervalSecondsInput" type="number" value="30" min="1" oninput="saveSettings(); refreshPoints()">
                     </label>
                     <label for="showIndividualPointsToggle" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; background: #fff; min-height: 38px;">
-                        <input id="showIndividualPointsToggle" type="checkbox" checked onchange="showIndividualPoints = this.checked; saveSettings(); refreshPoints();">
+                        <input id="showIndividualPointsToggle" type="checkbox" checked onchange="settingsState.showIndividualPoints = this.checked; saveSettings(); refreshPoints();">
                         Show points
                     </label>
                     <button type="button" id="btnSubmit" onclick="saveSettings(); closeSettingsOverlay(); loadTrackersAndPoints()">Apply</button>
@@ -3070,6 +4190,16 @@
                     <button type="button" id="nextTravelSegmentBtn" onclick="event.stopPropagation(); navigateTravelSegment(1)" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()">→</button>
                 </div>
                 <div id="segmentTimeframe" class="segment-timeframe">No segment selected</div>
+                <div id="segmentDebugControls" class="segment-debug-controls" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()" onclick="event.stopPropagation()">
+                    <button type="button" id="prevSegmentPointBtn" onclick="navigateSegmentPoint(-1)">Point ←</button>
+                    <span id="segmentPointCounter" class="segment-point-counter">Point 0 / 0</span>
+                    <button type="button" id="nextSegmentPointBtn" onclick="navigateSegmentPoint(1)">Point →</button>
+                    <button type="button" id="copySegmentPointBtn" onclick="copyCurrentSegmentDebugInfo('point')">Copy Point</button>
+                    <button type="button" id="copySegmentStopBtn" onclick="copyCurrentSegmentDebugInfo('stop')">Copy Stop</button>
+                    <button type="button" id="copySegmentDebugBtn" onclick="copyCurrentSegmentDebugInfo('segment')">Copy Segment</button>
+                    <div id="segmentPointTimestamp" class="segment-point-time">Select a segment</div>
+                </div>
+                <div id="segmentDebugStatus" class="segment-debug-status" aria-live="polite"></div>
                 <button type="button" id="segmentDrawerToggleButton" class="segment-drawer-toggle" onclick="event.stopPropagation(); toggleSegmentDrawerFromButton()" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()" aria-label="Expand segments drawer" aria-expanded="false" title="Expand segments drawer">▴</button>
             </div>
             <div class="segment-drawer-body">

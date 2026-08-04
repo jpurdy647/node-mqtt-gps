@@ -156,10 +156,21 @@ Backward compatibility aliases are still accepted:
 - Tracker filter, date range, and quick time-range controls.
 - Manual MQTT refresh interval options: Off, 10s, 30s, 60s, 2m, 5m, 10m.
 - Segment drawer with jump modes (Travel, Stops, Both) and prev/next navigation.
+- Segment drawer collapsed header shows date for non-today segments (weekday included on desktop).
+- Segment drawer includes point-by-point debug navigation for the selected segment.
+- Segment debug copy tools:
+  - Copy Point: current point details
+  - Copy Stop: stop metadata (stop segments only)
+  - Copy Segment: full segment payload including all segment points
 - Stop visualization:
   - stop radius circle with grayed center
   - stop points rendered in a muted style
   - selecting a stop highlights its circle and associated points
+- Segment boundary handling:
+  - stop keeps interior in-radius points
+  - first/last in-radius boundary points are treated as travel endpoints
+  - travel lines are visually extended by one adjacent stop point at each side when available
+  - contiguous travel-edge points that are still within adjacent stop radius are reassigned to that stop
 - Segment highlighting behavior:
   - selected segment is red
   - non-selected lines retain tracker color
@@ -168,6 +179,8 @@ Backward compatibility aliases are still accepted:
   - SVG pin markers with 2-character tracker IDs
   - all-tracker live overlay when a single tracker is selected and auto refresh is enabled
   - live refresh updates markers without recentering the map
+  - relative-now timeframe follow mode persists during manual live refresh loops
+  - merged live points can extend the current tracker line without re-running segmentation
 - Floating collapsible legend:
   - tracker colors
   - stop circle/point examples
@@ -182,6 +195,10 @@ Backward compatibility aliases are still accepted:
   - Check `GET /api/mqtt/manual-updates/status` for active watchers.
   - Confirm keepalive calls are being sent.
   - Confirm MQTT connectivity/credentials.
+- Live marker moves but line looks stale:
+  - Ensure the selected timeframe follows now (end near current time), or use quick ranges that end at now.
+  - Ensure the intended tracker is selected (line merge targets selected tracker when not in all-trackers mode).
+  - Use the segment debug copy tools to confirm incoming point times and ordering.
 - Data appears too sparse or too noisy:
   - Adjust accuracy filter and stop detection/sampling controls.
 
