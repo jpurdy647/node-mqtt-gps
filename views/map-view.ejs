@@ -63,6 +63,8 @@
         var manualUpdatesFollowTimer = null;
         var manualUpdatesKeepAliveSeconds = 20;
         var activeSearchFollowsNow = true;
+        var isHydratingStartupSettings = true;
+        var startupSettingsSnapshot = null;
         var stopDetectionRadiusMeters = 125;
         var stopDetectionMinPoints = 4;
         var stopDetectionMinSeconds = 180;
@@ -95,6 +97,12 @@
             if (!trackerId) {
                 return true;
             }
+
+            const selectedTrackerId = getCurrentSelectedTrackerId();
+            if (selectedTrackerId && selectedTrackerId !== 'all_trackers' && selectedTrackerId === trackerId) {
+                return true;
+            }
+
             return !Boolean(disabledTrackers && disabledTrackers[trackerId]);
         }
 
@@ -111,7 +119,35 @@
 
         function getCurrentSelectedTrackerId() {
             const trackerSelect = document.getElementById('selTrackers');
-            return trackerSelect && trackerSelect.value ? trackerSelect.value : 'all_trackers';
+            if (trackerSelect && trackerSelect.value) {
+                return trackerSelect.value;
+            }
+
+            const savedSettings = loadSettings();
+            if (savedSettings && savedSettings.trackerId) {
+                return savedSettings.trackerId;
+            }
+
+            const queryTrackerId = new URLSearchParams(window.location.search).get('tracker_id');
+            return queryTrackerId || 'all_trackers';
+        }
+
+        function isAllTrackersSelected() {
+            return getCurrentSelectedTrackerId() === 'all_trackers';
+        }
+
+        function updatePerformanceModeUi() {
+            const status = document.getElementById('performanceModeStatus');
+            if (!status) {
+                return;
+            }
+
+            const enabled = isAllTrackersSelected();
+            status.textContent = enabled
+                ? 'Performance mode active for all-trackers view'
+                : '';
+            status.classList.toggle('active', enabled);
+            status.classList.toggle('hidden', !enabled);
         }
 
         function isAutoMqttUpdateEnabled() {
@@ -188,16 +224,102 @@
             };
         }
 
+        function setPickerToLastOneDay() {
+            const picker = $('input[name="datetimes"]').data('daterangepicker');
+            if (!picker) {
+                return;
+            }
+            const nowMoment = moment();
+            picker.setStartDate(nowMoment.clone().startOf('day'));
+            picker.setEndDate(nowMoment);
+        }
+
+        function isTimeframeRelativeToNow(endMoment) {
+            if (!endMoment) {
+                return false;
+            }
+
+            const nowMs = Date.now();
+            const endMs = endMoment.toDate().getTime();
+            const toleranceMs = 90 * 1000;
+            return endMs >= (nowMs - toleranceMs);
+        }
+
+        function isRangeAnchoredToCurrentDay(startMoment, endMoment, referenceMoment = moment()) {
+            if (!startMoment || !endMoment || !referenceMoment) {
+                return false;
+            }
+
+            return startMoment.isSame(startMoment.clone().startOf('day')) && startMoment.isSame(referenceMoment, 'day') && endMoment.isSame(referenceMoment, 'day');
+        }
+
+        function getTimeframeSettingsForSave() {
+            const picker = $('input[name="datetimes"]').data('daterangepicker');
+            if (!picker || !picker.startDate || !picker.endDate) {
+                return {};
+            }
+
+            const startDate = picker.startDate.clone();
+            const endDate = picker.endDate.clone();
+            const followsNow = isTimeframeRelativeToNow(endDate);
+            const nowMs = Date.now();
+
+            return {
+                timeframeStartDate: startDate.toISOString(),
+                timeframeEndDate: endDate.toISOString(),
+                timeframeFollowsNow: followsNow,
+                timeframeDurationMs: Math.max(0, endDate.valueOf() - startDate.valueOf()),
+                timeframeEndOffsetMs: endDate.valueOf() - nowMs,
+                timeframeAnchoredToDayStart: followsNow && isRangeAnchoredToCurrentDay(startDate, endDate),
+            };
+        }
+
+        function applySavedTimeframeSettings(settings) {
+            const picker = $('input[name="datetimes"]').data('daterangepicker');
+            if (!picker || !settings) {
+                return;
+            }
+
+            const hasSavedRange = settings.timeframeStartDate && settings.timeframeEndDate;
+            if (!hasSavedRange) {
+                return;
+            }
+
+            const savedStart = moment(settings.timeframeStartDate);
+            const savedEnd = moment(settings.timeframeEndDate);
+            if (!savedStart.isValid() || !savedEnd.isValid()) {
+                return;
+            }
+
+            if (settings.timeframeFollowsNow) {
+                const nowMoment = moment();
+                if (settings.timeframeAnchoredToDayStart) {
+                    picker.setStartDate(nowMoment.clone().startOf('day'));
+                    picker.setEndDate(nowMoment);
+                    return;
+                }
+
+                const durationMs = Math.max(0, parseInt(settings.timeframeDurationMs, 10) || 0);
+                const endOffsetMs = Number.isFinite(parseInt(settings.timeframeEndOffsetMs, 10))
+                    ? parseInt(settings.timeframeEndOffsetMs, 10)
+                    : 0;
+                const restoredEnd = nowMoment.clone().add(endOffsetMs, 'milliseconds');
+                picker.setStartDate(restoredEnd.clone().subtract(durationMs, 'milliseconds'));
+                picker.setEndDate(restoredEnd);
+                return;
+            }
+
+            // Historical windows reset to last one day on restore.
+            setPickerToLastOneDay();
+        }
+
         function doesActiveSearchEndNow() {
             const picker = $('input[name="datetimes"]').data('daterangepicker');
             if (!picker || !picker.endDate) {
                 return false;
             }
 
-            const nowMs = Date.now();
-            const endMs = picker.endDate.toDate().getTime();
-            const toleranceMs = 90 * 1000;
-            return Math.abs(nowMs - endMs) <= toleranceMs;
+            return isTimeframeRelativeToNow(picker.endDate);
         }
 
         function syncPickerRangeToNowPreservingWindow() {
@@ -210,7 +332,7 @@
             const currentEnd = picker.endDate.clone();
             const newEnd = moment();
 
-            if (currentStart.isSame(currentStart.clone().startOf('day')) && currentStart.isSame(newEnd, 'day')) {
+            if (isRangeAnchoredToCurrentDay(currentStart, currentEnd, newEnd)) {
                 picker.setStartDate(newEnd.clone().startOf('day'));
                 picker.setEndDate(newEnd);
                 return;
@@ -269,11 +391,42 @@
                 });
         }
 
-        function saveSettings() {
+        function saveSettings(options = {}) {
             try {
-                const selectedTrackerId = document.getElementById('selTrackers').value || 'all_trackers';
+                const saveSource = options && options.source ? options.source : '';
+                const forceSave = Boolean(options && options.force);
+                if (isHydratingStartupSettings && !forceSave && saveSource !== 'tracker-select') {
+                    return;
+                }
+
+                const existingSettings = loadSettings() || {};
+                const trackerSelect = document.getElementById('selTrackers');
+                const selectHasOptions = Boolean(trackerSelect && trackerSelect.options && trackerSelect.options.length);
+                let selectedTrackerId = selectHasOptions
+                    ? (trackerSelect.value || existingSettings.trackerId || 'all_trackers')
+                    : (existingSettings.trackerId || 'all_trackers');
+
+                const existingTrackerId = existingSettings.trackerId || 'all_trackers';
+                const preserveExistingSpecificTracker =
+                    saveSource !== 'tracker-select' &&
+                    selectedTrackerId === 'all_trackers' &&
+                    existingTrackerId !== 'all_trackers';
+
+                if (preserveExistingSpecificTracker) {
+                    selectedTrackerId = existingTrackerId;
+                }
+
+                const timeframeSettings = getTimeframeSettingsForSave();
+                const quickHoursInput = document.getElementById('inp_quick_hours');
+                const quickDaysInput = document.getElementById('inp_quick_days');
+                const quickDaysAgoInput = document.getElementById('inp_quick_days_ago');
                 const settings = {
+                    ...existingSettings,
                     trackerId: selectedTrackerId,
+                    ...timeframeSettings,
+                    quickHoursValue: quickHoursInput ? quickHoursInput.value : '',
+                    quickDaysValue: quickDaysInput ? quickDaysInput.value : '',
+                    quickDaysAgoValue: quickDaysAgoInput ? quickDaysAgoInput.value : '',
                     liveTrackerScope: document.getElementById('liveTrackerScopeSelect').value || 'current',
                     manualMqttIntervalSeconds: document.getElementById('manualMqttIntervalSelect').value,
                     accuracyLimit: document.getElementById('accuracyFilterInput').value,
@@ -332,7 +485,7 @@
             return null;
         }
 
-        function applySettingsToForm(settings) {
+        function applySettingsToForm(settings, options = {}) {
             if (!settings) {
                 return;
             }
@@ -342,7 +495,8 @@
             }
             disabledTrackers = settings.disabledTrackers ? { ...settings.disabledTrackers } : {};
             const trackerSelect = document.getElementById('selTrackers');
-            if (trackerSelect && settings.trackerId !== undefined) {
+            const skipTrackerSelectionRestore = Boolean(options && options.skipTrackerSelectionRestore);
+            if (!skipTrackerSelectionRestore && trackerSelect && settings.trackerId !== undefined) {
                 const requestedTracker = settings.trackerId || 'all_trackers';
                 const offeredValues = Array.from(trackerSelect.options).map((option) => option.value);
                 if (offeredValues.includes(requestedTracker)) {
@@ -375,6 +529,18 @@
             if (sampleIntervalInput && settings.stopDetectionSampleIntervalSeconds !== undefined) {
                 sampleIntervalInput.value = settings.stopDetectionSampleIntervalSeconds;
             }
+            const quickHoursInput = document.getElementById('inp_quick_hours');
+            if (quickHoursInput && settings.quickHoursValue !== undefined) {
+                quickHoursInput.value = settings.quickHoursValue;
+            }
+            const quickDaysInput = document.getElementById('inp_quick_days');
+            if (quickDaysInput && settings.quickDaysValue !== undefined) {
+                quickDaysInput.value = settings.quickDaysValue;
+            }
+            const quickDaysAgoInput = document.getElementById('inp_quick_days_ago');
+            if (quickDaysAgoInput && settings.quickDaysAgoValue !== undefined) {
+                quickDaysAgoInput.value = settings.quickDaysAgoValue;
+            }
             const showPointsToggle = document.getElementById('showIndividualPointsToggle');
             if (showPointsToggle && settings.showIndividualPoints !== undefined) {
                 showPointsToggle.checked = settings.showIndividualPoints;
@@ -389,11 +555,14 @@
                 liveTrackerScopeSelect.value = settings.liveTrackerScope;
                 liveTrackerScope = liveTrackerScopeSelect.value || 'current';
             }
+            applySavedTimeframeSettings(settings);
             const segmentNavigationModeSelect = document.getElementById('segmentNavigationModeSelect');
             if (segmentNavigationModeSelect && settings.segmentNavigationMode !== undefined) {
                 segmentNavigationModeSelect.value = settings.segmentNavigationMode;
                 segmentNavigationMode = segmentNavigationModeSelect.value || 'travel';
             }
+            updatePerformanceModeUi();
+            updateLiveTrackerControlsUi();
         }
 
         function clearSegmentHighlight() {
@@ -405,24 +574,37 @@
             });
 
             detectedSegments.forEach((segment) => {
-                if (segment && segment.stopRadiusCircle && segment.stopRadiusCircle.setStyle) {
-                    segment.stopRadiusCircle.setStyle({
+                const stopRadiusLayers = Array.isArray(segment && segment.stopRadiusCircles)
+                    ? segment.stopRadiusCircles
+                    : (segment && segment.stopRadiusCircle ? [segment.stopRadiusCircle] : []);
+                stopRadiusLayers.forEach((layer) => {
+                    if (!layer || !layer.setStyle) {
+                        return;
+                    }
+                    layer.setStyle({
                         color: 'rgba(0, 0, 0, 0.45)',
                         weight: 1.2,
                         dashArray: '5,4',
                         fillColor: 'rgba(90, 90, 90, 0.2)',
                         fillOpacity: 0.35,
                     });
-                }
-                if (segment && segment.stopCenterDot && segment.stopCenterDot.setStyle) {
-                    segment.stopCenterDot.setStyle({
+                });
+
+                const stopCenterLayers = Array.isArray(segment && segment.stopCenterDots)
+                    ? segment.stopCenterDots
+                    : (segment && segment.stopCenterDot ? [segment.stopCenterDot] : []);
+                stopCenterLayers.forEach((layer) => {
+                    if (!layer || !layer.setStyle) {
+                        return;
+                    }
+                    layer.setStyle({
                         radius: 5,
                         color: 'rgba(75, 75, 75, 0.55)',
                         fillColor: 'rgba(100, 100, 100, 0.32)',
                         fillOpacity: 0.8,
                         weight: 1,
                     });
-                }
+                });
             });
 
             renderedPointMarkersById.forEach((marker) => {
@@ -555,6 +737,51 @@
             }
             highlightedSegment = segmentId;
             selectedSegmentId = segmentId;
+
+            if (segment.type === 'travel' && !segment.polyline && Array.isArray(segment.rawPoints) && segment.rawPoints.length >= 2) {
+                const trackerColor = getTrackerColor(segment.trackerId);
+                segment.polyline = L.polyline(segment.rawPoints.map((point) => [point.latitude, point.longitude]), { color: trackerColor, weight: 2, opacity: 0.8 }).addTo(transitionGroup);
+                segment.polyline._jpBaseStyle = { color: trackerColor, weight: 2, opacity: 0.8 };
+                segmentLayers.push(segment.polyline);
+            }
+
+            if (segment.type === 'stop' && (!Array.isArray(segment.stopRadiusCircles) || !segment.stopRadiusCircles.length)) {
+                const centers = Array.isArray(segment.centers) && segment.centers.length
+                    ? segment.centers
+                    : (segment.center ? [segment.center] : []);
+                const stopRadiusMeters = getStopDetectionRadiusMeters();
+                const stopCircles = [];
+                const centerDots = [];
+
+                centers.forEach((center) => {
+                    const stopCircle = L.circle([center.latitude, center.longitude], {
+                        radius: stopRadiusMeters,
+                        color: 'rgba(0, 0, 0, 0.45)',
+                        weight: 1.2,
+                        dashArray: '5,4',
+                        fillColor: 'rgba(90, 90, 90, 0.2)',
+                        fillOpacity: 0.35,
+                    }).addTo(transitionGroup);
+                    stopCircles.push(stopCircle);
+                    segmentLayers.push(stopCircle);
+
+                    const centerDot = L.circleMarker([center.latitude, center.longitude], {
+                        radius: 5,
+                        color: 'rgba(75, 75, 75, 0.55)',
+                        fillColor: 'rgba(100, 100, 100, 0.32)',
+                        fillOpacity: 0.8,
+                        weight: 1,
+                    }).addTo(transitionGroup);
+                    centerDots.push(centerDot);
+                    segmentLayers.push(centerDot);
+                });
+
+                segment.stopRadiusCircles = stopCircles;
+                segment.stopCenterDots = centerDots;
+                segment.stopRadiusCircle = stopCircles.length ? L.featureGroup(stopCircles) : null;
+                segment.stopCenterDot = centerDots.length ? L.featureGroup(centerDots) : null;
+            }
+
             if (segment.polyline) {
                 segment.polyline.setStyle({ color: '#ff3b30', weight: 5, opacity: 1 });
                 if (focusMap && segment.polyline.getBounds) {
@@ -570,25 +797,37 @@
             }
 
             if (segment.type === 'stop') {
-                if (segment.stopRadiusCircle && segment.stopRadiusCircle.setStyle) {
-                    segment.stopRadiusCircle.setStyle({
+                const stopRadiusLayers = Array.isArray(segment.stopRadiusCircles)
+                    ? segment.stopRadiusCircles
+                    : (segment.stopRadiusCircle ? [segment.stopRadiusCircle] : []);
+                stopRadiusLayers.forEach((layer) => {
+                    if (!layer || !layer.setStyle) {
+                        return;
+                    }
+                    layer.setStyle({
                         color: '#ff3b30',
                         weight: 2.4,
                         dashArray: null,
                         fillColor: 'rgba(255, 59, 48, 0.18)',
                         fillOpacity: 0.42,
                     });
-                }
+                });
 
-                if (segment.stopCenterDot && segment.stopCenterDot.setStyle) {
-                    segment.stopCenterDot.setStyle({
+                const stopCenterLayers = Array.isArray(segment.stopCenterDots)
+                    ? segment.stopCenterDots
+                    : (segment.stopCenterDot ? [segment.stopCenterDot] : []);
+                stopCenterLayers.forEach((layer) => {
+                    if (!layer || !layer.setStyle) {
+                        return;
+                    }
+                    layer.setStyle({
                         radius: 6,
                         color: '#ff3b30',
                         fillColor: '#ff3b30',
                         fillOpacity: 0.95,
                         weight: 1.5,
                     });
-                }
+                });
 
                 if (focusMap && segment.stopRadiusCircle && segment.stopRadiusCircle.getBounds && map) {
                     fitBoundsVisible(segment.stopRadiusCircle.getBounds(), {
@@ -783,7 +1022,6 @@
 
             processSegments2(points);
             const stopPointIds = new Set();
-            const stopRadiusMeters = getStopDetectionRadiusMeters();
 
             detectedSegments.forEach((segment) => {
                 if (segment.type !== 'stop') {
@@ -796,32 +1034,6 @@
                         stopPointIds.add(stopPoint.puid);
                     }
                 });
-
-                const center = segment.center;
-                if (!center) {
-                    return;
-                }
-
-                const stopCircle = L.circle([center.latitude, center.longitude], {
-                    radius: stopRadiusMeters,
-                    color: 'rgba(0, 0, 0, 0.45)',
-                    weight: 1.2,
-                    dashArray: '5,4',
-                    fillColor: 'rgba(90, 90, 90, 0.2)',
-                    fillOpacity: 0.35,
-                }).addTo(transitionGroup);
-                segmentLayers.push(stopCircle);
-                segment.stopRadiusCircle = stopCircle;
-
-                const centerDot = L.circleMarker([center.latitude, center.longitude], {
-                    radius: 5,
-                    color: 'rgba(75, 75, 75, 0.55)',
-                    fillColor: 'rgba(100, 100, 100, 0.32)',
-                    fillOpacity: 0.8,
-                    weight: 1,
-                }).addTo(transitionGroup);
-                segmentLayers.push(centerDot);
-                segment.stopCenterDot = centerDot;
             });
 
             points.forEach((trackerPoints, trackerId) => {
@@ -833,8 +1045,16 @@
                     return !stopPointIds.has(p.puid);
                 });
 
+                const trackerTravelSegments = detectedSegments.filter((segment) =>
+                    segment &&
+                    segment.type === 'travel' &&
+                    segment.trackerId === trackerId &&
+                    Array.isArray(segment.rawPoints) &&
+                    segment.rawPoints.length >= 2
+                );
+
                 var polyline = null;
-                if (trackerLinePoints.length >= 2) {
+                if (showIndividualPoints && trackerLinePoints.length >= 2) {
                     polyline = L.polyline(trackerLinePoints.map((p) => [p.latitude, p.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
                     polyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
                     segmentLayers.push(polyline);
@@ -844,6 +1064,26 @@
                             paddingBottomRight: [20, 20 + getDrawerOcclusionHeight()],
                         });
                     }
+                } else if (!showIndividualPoints && trackerTravelSegments.length) {
+                    const segmentPolylines = [];
+                    trackerTravelSegments.forEach((segment) => {
+                        const segmentPolyline = L.polyline(segment.rawPoints.map((point) => [point.latitude, point.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
+                        segmentPolyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
+                        segmentLayers.push(segmentPolyline);
+                        segmentPolylines.push(segmentPolyline);
+                    });
+
+                    if (!preserveViewport && segmentPolylines.length) {
+                        const segmentGroup = L.featureGroup(segmentPolylines);
+                        fitBoundsVisible(segmentGroup.getBounds(), {
+                            paddingTopLeft: [20, 20],
+                            paddingBottomRight: [20, 20 + getDrawerOcclusionHeight()],
+                        });
+                    }
+
+                    polyline = segmentPolylines.length === 1
+                        ? segmentPolylines[0]
+                        : (segmentPolylines.length ? L.featureGroup(segmentPolylines) : null);
                 }
 
                 detectedSegments.push({
@@ -851,7 +1091,9 @@
                     trackerId: trackerId,
                     type: 'travel',
                     label: trackerId || 'Tracker',
-                    pointCount: trackerLinePoints.length,
+                    pointCount: showIndividualPoints
+                        ? trackerLinePoints.length
+                        : trackerTravelSegments.reduce((count, segment) => count + segment.rawPoints.length, 0),
                     points: [],
                     polyline: polyline,
                 });
@@ -926,7 +1168,7 @@
         }
 
         function loadTrackersAndPoints(options = {}) {
-            saveSettings();
+            saveSettings({ source: 'auto' });
             if (!options || options.evaluateFollowMode !== false) {
                 activeSearchFollowsNow = doesActiveSearchEndNow();
             }
@@ -941,14 +1183,22 @@
                     const trackerGroups = Array.isArray(response.trackers) ? response.trackers : [];
                     processPoints(trackerGroups);
                     showPoints(options);
+                    if (isHydratingStartupSettings) {
+                        applySettingsToForm(startupSettingsSnapshot || loadSettings() || {}, { skipTrackerSelectionRestore: true });
+                        isHydratingStartupSettings = false;
+                    }
                 } catch (err) {
                     console.error("Failed to load points", err);
                     points = new Map();
                     showPoints(options);
+                    if (isHydratingStartupSettings) {
+                        applySettingsToForm(startupSettingsSnapshot || loadSettings() || {}, { skipTrackerSelectionRestore: true });
+                        isHydratingStartupSettings = false;
+                    }
                 }
             }
             // Get the selected tracker ID from the query or the dropdown
-            var selectedTrackerId = document.getElementById("selTrackers").value || new URLSearchParams(window.location.search).get('tracker_id') || "";
+            var selectedTrackerId = getCurrentSelectedTrackerId() || "all_trackers";
             xhttp.open("GET", "/points?tracker_id=" + encodeURIComponent(selectedTrackerId) + "&seconds_start=" + $('input[name="datetimes"]').data('daterangepicker').startDate.toDate().getTime()/1000 + "&seconds_end=" + $('input[name="datetimes"]').data('daterangepicker').endDate.toDate().getTime()/1000, true);
             xhttp.send();
         }
@@ -1023,6 +1273,10 @@
             const windowPoints = getStopDetectionWindowPoints();
             const exitPoints = getStopDetectionExitPoints();
             const sampleIntervalSeconds = getStopDetectionSampleIntervalSeconds();
+            const allTrackersSelected = isAllTrackersSelected();
+            const effectiveSampleIntervalSeconds = allTrackersSelected
+                ? Math.max(sampleIntervalSeconds, sampleIntervalSeconds * 2)
+                : sampleIntervalSeconds;
             const entryPoints = Math.max(2, minPoints, windowPoints);
 
             let warnedAboutOutOfOrder = false;
@@ -1044,12 +1298,13 @@
             };
 
             pointsMap.forEach((trackerPoints, trackerId) => {
-                const pointsArr = samplePointsByTime(trackerPoints.values(), sampleIntervalSeconds);
+                const pointsArr = samplePointsByTime(trackerPoints.values(), effectiveSampleIntervalSeconds);
                 if (pointsArr.length < minPoints) {
                     return;
                 }
 
                 warnAboutOutOfOrder(trackerId, pointsArr);
+                const rawSegments = [];
 
                 const normalizeSegmentTime = (timeValue) => {
                     const time = new Date(timeValue).getTime();
@@ -1095,35 +1350,120 @@
                         ? Math.max(startValue, endValue)
                         : (endValue !== null ? endValue : startValue);
 
-                    const segmentId = `segment-${detectedSegments.length + 1}`;
-                    const label = type === Mode.STOP
-                        ? `Stop ${new Date(segmentStartTime || startTime).toLocaleString()}`
-                        : `Travel ${new Date(segmentStartTime || startTime).toLocaleString()}`;
+                    rawSegments.push({
+                        trackerId: trackerId,
+                        type: type === Mode.STOP ? 'stop' : 'travel',
+                        pointCount: points.length,
+                        rawPoints: points.slice(),
+                        center: center,
+                        centers: center ? [center] : [],
+                        startTime: segmentStartTime,
+                        endTime: segmentEndTime,
+                    });
+                };
 
-                    let polyline = null;
-                    const trackerColor = getTrackerColor(trackerId);
-                    if (type === Mode.MOVING) {
-                        polyline = L.polyline(points.map((point) => [point.latitude, point.longitude]), { color: trackerColor, weight: 2, opacity: 0.8 }).addTo(linesGroup);
-                        polyline._jpBaseStyle = { color: trackerColor, weight: 2, opacity: 0.8 };
-                        segmentLayers.push(polyline);
-                    } else {
-                        const marker = L.marker([center.latitude, center.longitude], { icon: L.divIcon({ html: `<div style="background:${trackerColor};width:10px;height:10px;border-radius:50%;"></div>`, iconSize: [10, 10], iconAnchor: [5, 5] }) }).bindPopup(`Stop ${new Date(segmentStartTime || startTime).toLocaleString()}`).addTo(transitionGroup);
-                        stopPoint = marker;
-                        segmentLayers.push(marker);
+                const isPointWithinCenterRadius = (point, center) => {
+                    if (!point || !center) {
+                        return false;
                     }
+                    return calculateDistance(point.latitude, point.longitude, center.latitude, center.longitude, 'meters') <= radiusMeters;
+                };
+
+                const dedupeCenters = (centersList) => {
+                    const seen = new Set();
+                    return (Array.isArray(centersList) ? centersList : []).filter((center) => {
+                        if (!center) {
+                            return false;
+                        }
+                        const centerKey = `${Number(center.latitude).toFixed(6)}:${Number(center.longitude).toFixed(6)}`;
+                        if (seen.has(centerKey)) {
+                            return false;
+                        }
+                        seen.add(centerKey);
+                        return true;
+                    });
+                };
+
+                const canMergeStopBridge = (leftStop, bridgeSegment, rightStop) => {
+                    if (!leftStop || !bridgeSegment || !rightStop) {
+                        return false;
+                    }
+                    if (leftStop.type !== 'stop' || bridgeSegment.type !== 'travel' || rightStop.type !== 'stop') {
+                        return false;
+                    }
+
+                    const stopCenters = dedupeCenters([
+                        ...(Array.isArray(leftStop.centers) ? leftStop.centers : []),
+                        ...(Array.isArray(rightStop.centers) ? rightStop.centers : []),
+                    ]);
+
+                    if (!stopCenters.length) {
+                        return false;
+                    }
+
+                    const bridgePoints = Array.isArray(bridgeSegment.rawPoints) ? bridgeSegment.rawPoints.filter(Boolean) : [];
+                    const maxMergeBridgePoints = Math.max(exitPoints * 3, 12);
+                    if (!bridgePoints.length || bridgePoints.length > maxMergeBridgePoints) {
+                        return false;
+                    }
+
+                    return bridgePoints.every((point) => stopCenters.some((center) => isPointWithinCenterRadius(point, center)));
+                };
+
+                const mergeStopBridgeSegments = (segmentsList) => {
+                    const mergedSegments = [];
+
+                    for (let segmentIndex = 0; segmentIndex < segmentsList.length; segmentIndex++) {
+                        const currentSegment = segmentsList[segmentIndex];
+                        const previousSegment = mergedSegments[mergedSegments.length - 1];
+                        const nextSegment = segmentsList[segmentIndex + 1];
+
+                        if (previousSegment && canMergeStopBridge(previousSegment, currentSegment, nextSegment)) {
+                            previousSegment.rawPoints = previousSegment.rawPoints.concat(currentSegment.rawPoints || [], nextSegment.rawPoints || []);
+                            previousSegment.pointCount = previousSegment.rawPoints.length;
+                            previousSegment.endTime = nextSegment.endTime;
+                            previousSegment.centers = dedupeCenters([
+                                ...(Array.isArray(previousSegment.centers) ? previousSegment.centers : []),
+                                ...(Array.isArray(nextSegment.centers) ? nextSegment.centers : []),
+                            ]);
+                            previousSegment.center = previousSegment.centers[0] || previousSegment.center || nextSegment.center || null;
+                            segmentIndex += 1;
+                            continue;
+                        }
+
+                        mergedSegments.push({
+                            ...currentSegment,
+                            rawPoints: Array.isArray(currentSegment.rawPoints) ? currentSegment.rawPoints.slice() : [],
+                            centers: Array.isArray(currentSegment.centers) ? currentSegment.centers.slice() : [],
+                        });
+                    }
+
+                    return mergedSegments;
+                };
+
+                const renderSegment = (segment) => {
+                    if (!segment || !Array.isArray(segment.rawPoints) || !segment.rawPoints.length) {
+                        return;
+                    }
+
+                    const segmentId = `segment-${detectedSegments.length + 1}`;
+                    const label = segment.type === 'stop'
+                        ? `Stop ${new Date(segment.startTime).toLocaleString()}`
+                        : `Travel ${new Date(segment.startTime).toLocaleString()}`;
 
                     detectedSegments.push({
                         id: segmentId,
                         trackerId: trackerId,
-                        type: type === Mode.STOP ? 'stop' : 'travel',
+                        type: segment.type,
                         label: label,
-                        pointCount: points.length,
-                        points: type === Mode.STOP ? [stopPoint] : points,
-                        rawPoints: points,
-                        center: center,
-                        polyline: polyline,
-                        startTime: segmentStartTime,
-                        endTime: segmentEndTime,
+                        pointCount: segment.rawPoints.length,
+                        points: [],
+                        rawPoints: segment.rawPoints,
+                        center: segment.center,
+                        centers: Array.isArray(segment.centers) ? segment.centers : (segment.center ? [segment.center] : []),
+                        polyline: null,
+                        startTime: segment.startTime,
+                        endTime: segment.endTime,
                     });
                 };
 
@@ -1252,6 +1592,7 @@
                         getPointTime(trailingStopPoints[trailingStopPoints.length - 1]),
                         trailingStopState.valid ? trailingStopState.center : stopCenter
                     );
+                    (allTrackersSelected ? rawSegments : mergeStopBridgeSegments(rawSegments)).forEach(renderSegment);
                     return;
                 }
 
@@ -1262,6 +1603,8 @@
                     getPointTime(trailingMovingPoints[0]),
                     getPointTime(trailingMovingPoints[trailingMovingPoints.length - 1])
                 );
+
+                (allTrackersSelected ? rawSegments : mergeStopBridgeSegments(rawSegments)).forEach(renderSegment);
             });
         }
 
@@ -1383,9 +1726,19 @@
 
             const liveScopeLabel = liveTrackerScope === 'all' ? 'All trackers in DB' : 'Current tracker only';
             const liveRefreshLabel = isAutoMqttUpdateEnabled() ? 'Live markers refreshing' : 'Live markers off';
+            const selectedTrackerId = getCurrentSelectedTrackerId();
+            const performanceModeLabel = isAllTrackersSelected() ? 'Active (all trackers selected)' : 'Inactive';
+            const pointTrackers = Array.from((points && points.keys ? points.keys() : []));
+            const knownTrackers = Array.isArray(allTrackers) ? allTrackers : [];
+            const legendTrackerCandidates = selectedTrackerId === 'all_trackers'
+                ? Array.from(new Set([...knownTrackers, ...pointTrackers]))
+                : [selectedTrackerId];
+            const activeLegendTrackers = legendTrackerCandidates
+                .filter((trackerId) => Boolean(trackerId) && trackerId !== 'all_trackers')
+                .sort((left, right) => String(left).localeCompare(String(right)));
 
-            const trackerRows = trackers.length
-                ? trackers.map((trackerId) => {
+            const trackerRows = activeLegendTrackers.length
+                ? activeLegendTrackers.map((trackerId) => {
                     const color = getTrackerColor(trackerId);
                     const disabledClass = isTrackerEnabled(trackerId) ? '' : ' disabled';
                     const toggleVerb = isTrackerEnabled(trackerId) ? 'Disable' : 'Enable';
@@ -1394,7 +1747,7 @@
                         <span class='tracker-legend-label'>${trackerId}</span>
                     </button>`;
                 }).join('')
-                : "<div class='tracker-legend-empty'>No trackers loaded yet.</div>";
+                : "<div class='tracker-legend-empty'>No tracker lines in current results.</div>";
 
             container.innerHTML = `
                 <div class='tracker-legend-section'>
@@ -1418,6 +1771,8 @@
                     <div class='tracker-legend-title'>Live Markers</div>
                     <div class='tracker-legend-status'>${liveRefreshLabel}</div>
                     <div class='tracker-legend-substatus'>Scope: ${liveScopeLabel}</div>
+                    <div class='tracker-legend-substatus'>Performance mode: ${performanceModeLabel}</div>
+                    <div class='tracker-legend-substatus'>Visible line trackers: ${activeLegendTrackers.length}</div>
                     <div class='tracker-legend-substatus'>Known trackers: ${trackers.length}</div>
                 </div>
             `;
@@ -1489,7 +1844,8 @@
             trackers = Array.isArray(allTrackers) ? allTrackers : [];
             const savedSettings = loadSettings();
             const queryTrackerId = new URLSearchParams(window.location.search).get('tracker_id');
-            const previouslySelectedTracker = (savedSettings && savedSettings.trackerId) || document.getElementById("selTrackers").value || queryTrackerId || "";
+            const existingSelectedTracker = document.getElementById("selTrackers").value;
+            const previouslySelectedTracker = existingSelectedTracker || (savedSettings && savedSettings.trackerId) || queryTrackerId || "";
             const selectedTrackerId = previouslySelectedTracker || "all_trackers";
             
             const selTrackers = document.getElementById("selTrackers");
@@ -1515,7 +1871,7 @@
             if (!trackers.includes(selectedTrackerId) && trackers.length > 0) {
                 selTrackers.value = "all_trackers";
             }
-            applySettingsToForm(savedSettings || {});
+            applySettingsToForm(savedSettings || {}, { skipTrackerSelectionRestore: true });
             renderTrackerColorControls();
         }
 
@@ -1550,11 +1906,18 @@
 
         function setSegmentDrawerExpanded(expanded) {
             const drawer = document.getElementById('segmentDrawer');
+            const toggleButton = document.getElementById('segmentDrawerToggleButton');
             if (!drawer) {
                 return;
             }
             drawer.classList.toggle('expanded', expanded);
             drawer.classList.toggle('collapsed', !expanded);
+            if (toggleButton) {
+                toggleButton.textContent = expanded ? '▾' : '▴';
+                toggleButton.setAttribute('aria-label', expanded ? 'Collapse segments drawer' : 'Expand segments drawer');
+                toggleButton.setAttribute('title', expanded ? 'Collapse segments drawer' : 'Expand segments drawer');
+                toggleButton.setAttribute('aria-expanded', String(expanded));
+            }
             if (map && map.invalidateSize) {
                 setTimeout(() => map.invalidateSize(), 50);
                 if (selectedSegmentId) {
@@ -1815,9 +2178,34 @@
             return Number.isFinite(intervalSeconds) ? intervalSeconds : 0;
         }
 
+        function updateLiveTrackerControlsUi() {
+            const intervalSeconds = getManualMqttIntervalSeconds();
+            const isEnabled = intervalSeconds > 0;
+            const liveTrackerScopeSelect = document.getElementById('liveTrackerScopeSelect');
+            const liveTrackerStatus = document.getElementById('liveTrackerSettingsStatus');
+            const liveTrackerSettingsGroup = document.getElementById('liveTrackerSettingsGroup');
+
+            if (liveTrackerScopeSelect) {
+                liveTrackerScopeSelect.disabled = !isEnabled;
+            }
+
+            if (liveTrackerStatus) {
+                liveTrackerStatus.textContent = isEnabled
+                    ? `Enabled via MQTT refresh every ${intervalSeconds}s`
+                    : 'Enable MQTT refresh to update live tracker markers';
+            }
+
+            if (liveTrackerSettingsGroup) {
+                liveTrackerSettingsGroup.classList.toggle('disabled', !isEnabled);
+            }
+
+            renderTrackerLegend();
+        }
+
         function updateManualUpdateWatcherFromUi() {
             const clientId = getOrCreateManualUpdatesClientId();
             const intervalSeconds = getManualMqttIntervalSeconds();
+            updateLiveTrackerControlsUi();
 
             if (intervalSeconds > 0) {
                 postJson('/api/mqtt/manual-updates/watch', { clientId, intervalSeconds })
@@ -1862,8 +2250,8 @@
             initMap();
             initDateTimePicker();
 
-            const settings = loadSettings();
-            applySettingsToForm(settings);
+            startupSettingsSnapshot = loadSettings();
+            applySettingsToForm(startupSettingsSnapshot);
             updateManualUpdateWatcherFromUi();
 
             const ensureMapReady = () => {
@@ -1970,7 +2358,7 @@
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 10px 12px;
             margin-top: 8px;
-            align-items: end;
+            align-items: start;
         }
 
         .map-controls label,
@@ -2178,8 +2566,17 @@
             overflow: auto;
             padding: 9px 10px 10px;
         }
+        .tracker-legend.collapsed {
+            width: auto;
+            min-width: 0;
+            max-width: calc(100vw - 24px);
+        }
         .tracker-legend.collapsed .tracker-legend-body {
             display: none;
+        }
+        .tracker-legend.collapsed .tracker-legend-header {
+            padding: 7px 8px;
+            gap: 6px;
         }
         .tracker-legend-section {
             margin-bottom: 10px;
@@ -2286,6 +2683,58 @@
             color: #64748b;
             margin-bottom: 2px;
         }
+        .performance-mode-status {
+            display: block;
+            margin-top: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #64748b;
+            line-height: 1.3;
+        }
+        .performance-mode-status.active {
+            color: #1d4ed8;
+        }
+        .performance-mode-status.hidden {
+            display: none;
+        }
+        .live-tracker-settings-group {
+            grid-column: 1 / -1;
+            display: grid;
+            gap: 8px;
+            padding: 10px 12px;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 12px;
+            background: linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.96));
+        }
+        .live-tracker-settings-group.disabled {
+            opacity: 0.72;
+        }
+        .live-tracker-settings-header {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .live-tracker-settings-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #0f172a;
+        }
+        .live-tracker-settings-status {
+            font-size: 12px;
+            font-weight: 600;
+            color: #334155;
+        }
+        .live-tracker-settings-help {
+            font-size: 11px;
+            color: #64748b;
+            line-height: 1.4;
+        }
+        .live-tracker-settings-body {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px 12px;
+        }
         .settings-overlay {
             position: fixed;
             inset: 0;
@@ -2324,6 +2773,7 @@
             display: grid;
             gap: 10px;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            align-items: start;
         }
         .settings-card .map-controls label,
         .settings-card .map-controls input,
@@ -2450,8 +2900,55 @@
                 left: 8px;
                 width: min(300px, calc(100vw - 16px));
             }
+            .tracker-legend-header {
+                justify-content: flex-start;
+                gap: 10px;
+            }
+            .tracker-legend-toggle {
+                order: -1;
+            }
             .settings-card {
                 padding: 12px;
+            }
+            .segment-drawer-handle {
+                display: grid;
+                grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) minmax(44px, 1fr);
+                grid-template-areas:
+                    "mode nav toggle"
+                    "time time time"
+                    "grabber grabber grabber";
+                align-items: center;
+                justify-items: center;
+                row-gap: 6px;
+                column-gap: 8px;
+                min-height: 82px;
+                padding: 8px 10px 10px;
+            }
+            .segment-nav-mode {
+                position: static;
+                grid-area: mode;
+                justify-self: start;
+                margin: 0;
+            }
+            .segment-drawer .segment-nav {
+                grid-area: nav;
+                justify-self: center;
+                margin: 0;
+            }
+            .segment-drawer-toggle {
+                position: static;
+                grid-area: toggle;
+                justify-self: end;
+            }
+            .segment-timeframe {
+                grid-area: time;
+                width: 100%;
+                text-align: center;
+                margin-top: 0;
+            }
+            .segment-drawer-grabber {
+                grid-area: grabber;
+                margin-top: 0;
             }
             .segment-drawer.expanded {
                 height: min(78vh, 620px);
@@ -2499,28 +2996,38 @@
                         <input type="text" id="sel_datetimes" name="datetimes"/>
                     </label>
                     <label for="selTrackers">Tracker
-                        <select id="selTrackers" oninput="saveSettings(); refreshPoints()"></select>
+                        <select id="selTrackers" oninput="saveSettings({ source: 'tracker-select' }); updatePerformanceModeUi(); refreshPoints()"></select>
+                        <span id="performanceModeStatus" class="performance-mode-status hidden"></span>
                     </label>
                     <label for="accuracyFilterInput">Accuracy Limit
                         <input id="accuracyFilterInput" type="number" value="150" oninput="saveSettings(); refreshPoints()">
                     </label>
-                    <label for="manualMqttIntervalSelect">Manual MQTT Refresh
-                        <select id="manualMqttIntervalSelect" oninput="saveSettings(); updateManualUpdateWatcherFromUi()">
-                            <option value="10">Every 10s</option>
-                            <option value="30" selected>Every 30s</option>
-                            <option value="60">Every 60s</option>
-                            <option value="120">Every 2m</option>
-                            <option value="300">Every 5m</option>
-                            <option value="600">Every 10m</option>
-                            <option value="0">Off</option>
-                        </select>
-                    </label>
-                    <label for="liveTrackerScopeSelect">Live Trackers
-                        <select id="liveTrackerScopeSelect" oninput="saveSettings(); refreshLiveMarkers()">
-                            <option value="current">Current tracker only</option>
-                            <option value="all">All trackers in DB</option>
-                        </select>
-                    </label>
+                    <div id="liveTrackerSettingsGroup" class="live-tracker-settings-group">
+                        <div class="live-tracker-settings-header">
+                            <div class="live-tracker-settings-title">Live Tracker Updates</div>
+                            <div id="liveTrackerSettingsStatus" class="live-tracker-settings-status">Enabled via MQTT refresh every 30s</div>
+                        </div>
+                        <div class="live-tracker-settings-help">MQTT refresh turns live tracker updates on. When refresh is off, live markers stay static and scope selection is disabled.</div>
+                        <div id="liveTrackerSettingsBody" class="live-tracker-settings-body">
+                            <label for="manualMqttIntervalSelect">MQTT Refresh Interval
+                                <select id="manualMqttIntervalSelect" oninput="saveSettings(); updateManualUpdateWatcherFromUi()">
+                                    <option value="10">Every 10s</option>
+                                    <option value="30" selected>Every 30s</option>
+                                    <option value="60">Every 60s</option>
+                                    <option value="120">Every 2m</option>
+                                    <option value="300">Every 5m</option>
+                                    <option value="600">Every 10m</option>
+                                    <option value="0">Off</option>
+                                </select>
+                            </label>
+                            <label for="liveTrackerScopeSelect">Live Tracker Scope
+                                <select id="liveTrackerScopeSelect" oninput="saveSettings(); refreshLiveMarkers()">
+                                    <option value="current">Current tracker only</option>
+                                    <option value="all">All trackers in DB</option>
+                                </select>
+                            </label>
+                        </div>
+                    </div>
                     <label for="stopDetectionRadiusInput">Stop Radius (m)
                         <input id="stopDetectionRadiusInput" type="number" value="125" min="1" oninput="saveSettings(); refreshPoints()">
                     </label>
@@ -2563,7 +3070,7 @@
                     <button type="button" id="nextTravelSegmentBtn" onclick="event.stopPropagation(); navigateTravelSegment(1)" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()">→</button>
                 </div>
                 <div id="segmentTimeframe" class="segment-timeframe">No segment selected</div>
-                <button type="button" class="segment-drawer-toggle" onclick="event.stopPropagation(); toggleSegmentDrawerFromButton()" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()" aria-label="Toggle segments drawer">▾</button>
+                <button type="button" id="segmentDrawerToggleButton" class="segment-drawer-toggle" onclick="event.stopPropagation(); toggleSegmentDrawerFromButton()" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()" aria-label="Expand segments drawer" aria-expanded="false" title="Expand segments drawer">▴</button>
             </div>
             <div class="segment-drawer-body">
                 <div id="segmentList"></div>
