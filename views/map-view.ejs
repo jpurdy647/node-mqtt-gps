@@ -73,9 +73,10 @@
         var stopDetectionRadiusMeters = 125;
         var stopDetectionMinPoints = 4;
         var stopDetectionMinSeconds = 180;
-        var stopDetectionWindowPoints = 6;
+        var stopDetectionWindowPoints = 4;
         var stopDetectionExitPoints = 3;
         var stopDetectionSampleIntervalSeconds = 30;
+        var accuracyFilteredPointCount = 0;
 
         function createDefaultSettingsState() {
             return {
@@ -88,11 +89,12 @@
                 accuracyLimit: '150',
                 stopDetectionRadiusMeters: 125,
                 stopDetectionMinSeconds: 180,
-                stopDetectionWindowPoints: 6,
+                stopDetectionWindowPoints: 4,
                 stopDetectionExitPoints: 3,
                 stopDetectionSampleIntervalSeconds: 30,
-                segmentNavigationMode: 'travel',
+                segmentNavigationMode: 'both',
                 showIndividualPoints: true,
+                speedColoredLineEnabled: false,
                 trackerColors: {},
                 disabledTrackers: {},
                 timeframeStartDate: null,
@@ -204,6 +206,25 @@
                 : '';
             status.classList.toggle('active', enabled);
             status.classList.toggle('hidden', !enabled);
+            updateSpeedColoredLineUi();
+        }
+
+        function isSpeedColoredLineModeEnabled() {
+            return !isAllTrackersSelected() && Boolean(settingsState && settingsState.speedColoredLineEnabled);
+        }
+
+        function updateSpeedColoredLineUi() {
+            const toggle = document.getElementById('speedColoredLineToggle');
+            if (!toggle) {
+                return;
+            }
+
+            const singleTrackerMode = !isAllTrackersSelected();
+            toggle.disabled = !singleTrackerMode;
+
+            if (settingsState && settingsState.speedColoredLineEnabled !== undefined) {
+                toggle.checked = Boolean(settingsState.speedColoredLineEnabled);
+            }
         }
 
         function isAutoMqttUpdateEnabled() {
@@ -338,12 +359,14 @@
 
             const hasSavedRange = settings.timeframeStartDate && settings.timeframeEndDate;
             if (!hasSavedRange) {
+                updateTimeframeIndicator();
                 return;
             }
 
             const savedStart = moment(settings.timeframeStartDate);
             const savedEnd = moment(settings.timeframeEndDate);
             if (!savedStart.isValid() || !savedEnd.isValid()) {
+                updateTimeframeIndicator();
                 return;
             }
 
@@ -352,6 +375,7 @@
                 if (settings.timeframeAnchoredToDayStart) {
                     picker.setStartDate(nowMoment.clone().startOf('day'));
                     picker.setEndDate(nowMoment);
+                    updateTimeframeIndicator();
                     return;
                 }
 
@@ -362,12 +386,64 @@
                 const restoredEnd = nowMoment.clone().add(endOffsetMs, 'milliseconds');
                 picker.setStartDate(restoredEnd.clone().subtract(durationMs, 'milliseconds'));
                 picker.setEndDate(restoredEnd);
+                updateTimeframeIndicator();
                 return;
             }
 
             // Preserve saved historical windows exactly as selected.
             picker.setStartDate(savedStart);
             picker.setEndDate(savedEnd);
+            updateTimeframeIndicator();
+        }
+
+        function getSelectedTimeframeLines() {
+            const picker = $('input[name="datetimes"]').data('daterangepicker');
+            if (!picker || !picker.startDate || !picker.endDate) {
+                return {
+                    start: 'Timeframe unavailable',
+                    end: '',
+                };
+            }
+
+            const startDate = picker.startDate.toDate();
+            const endDate = picker.endDate.toDate();
+            const fullDateTimeFormatter = new Intl.DateTimeFormat([], {
+                weekday: 'short',
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+            });
+
+            return {
+                start: fullDateTimeFormatter.format(startDate),
+                end: fullDateTimeFormatter.format(endDate),
+            };
+        }
+
+        function updateTimeframeIndicator() {
+            const legendStartPrefix = document.getElementById('legendTimeframeStartPrefix');
+            const legendStartValue = document.getElementById('legendTimeframeStartValue');
+            const legendEndPrefix = document.getElementById('legendTimeframeEndPrefix');
+            const legendEndValue = document.getElementById('legendTimeframeEndValue');
+            if (!legendStartPrefix || !legendStartValue || !legendEndPrefix || !legendEndValue) {
+                return;
+            }
+
+            const timeframeLines = getSelectedTimeframeLines();
+            const hasRange = Boolean(timeframeLines && timeframeLines.start && timeframeLines.end);
+            if (hasRange) {
+                legendStartPrefix.textContent = 'From';
+                legendStartValue.textContent = timeframeLines.start;
+                legendEndPrefix.textContent = 'to';
+                legendEndValue.textContent = timeframeLines.end;
+                return;
+            }
+
+            legendStartPrefix.textContent = '';
+            legendStartValue.textContent = timeframeLines.start || 'Timeframe unavailable';
+            legendEndPrefix.textContent = '';
+            legendEndValue.textContent = '';
         }
 
         function doesActiveSearchEndNow() {
@@ -409,13 +485,21 @@
         function buildTrackerPointMap(pointsArr, sampleByInterval) {
             const parsedPoints = new Map();
             const safePoints = Array.isArray(pointsArr) ? pointsArr : [];
+            const shouldCountFilteredPoints = sampleByInterval === true;
+            if (shouldCountFilteredPoints) {
+                accuracyFilteredPointCount = 0;
+            }
             safePoints.forEach((tp) => {
                 const trackerId = tp && (tp.tracker_id || tp.tid || tp.id);
                 const pointItems = Array.isArray(tp && tp.points) ? tp.points : [];
+                const accuracyLimitInput = document.getElementById('accuracyFilterInput');
+                const accuracyLimit = Number((accuracyLimitInput && accuracyLimitInput.value) || 150);
                 const filteredPoints = pointItems.reduce((accum, p) => {
-                    if (p && p.gps_accuracy <= (document.getElementById('accuracyFilterInput').value || 150)) {
+                    if (p && p.gps_accuracy <= accuracyLimit) {
                         p.localTime = new Date(p.time).toLocaleString();
                         accum.set(p.puid, p);
+                    } else if (p && shouldCountFilteredPoints) {
+                        accuracyFilteredPointCount += 1;
                     }
                     return accum;
                 }, new Map());
@@ -619,6 +703,7 @@
                     stopDetectionSampleIntervalSeconds: document.getElementById('stopDetectionSampleIntervalSecondsInput').value,
                     segmentNavigationMode: document.getElementById('segmentNavigationModeSelect').value,
                     showIndividualPoints: settingsState.showIndividualPoints,
+                    speedColoredLineEnabled: Boolean(document.getElementById('speedColoredLineToggle') && document.getElementById('speedColoredLineToggle').checked),
                     trackerColors: { ...(trackerColors || {}) },
                     disabledTrackers: { ...(disabledTrackers || {}) },
                 });
@@ -727,6 +812,10 @@
             if (showPointsToggle && settingsState.showIndividualPoints !== undefined) {
                 showPointsToggle.checked = settingsState.showIndividualPoints;
             }
+            const speedColoredLineToggle = document.getElementById('speedColoredLineToggle');
+            if (speedColoredLineToggle && settingsState.speedColoredLineEnabled !== undefined) {
+                speedColoredLineToggle.checked = Boolean(settingsState.speedColoredLineEnabled);
+            }
             const manualIntervalSelect = document.getElementById('manualMqttIntervalSelect');
             if (manualIntervalSelect && settingsState.manualMqttIntervalSeconds !== undefined) {
                 manualIntervalSelect.value = settingsState.manualMqttIntervalSeconds;
@@ -742,6 +831,7 @@
             }
             updatePerformanceModeUi();
             updateLiveTrackerControlsUi();
+            updateSpeedColoredLineUi();
         }
 
         function clearSegmentHighlight() {
@@ -847,7 +937,8 @@
                 includeCollapsed: Boolean(options && options.includeCollapsedDrawer),
             });
             if (drawerOcclusion > 0) {
-                map.panBy([0, -Math.round(drawerOcclusion / 2)], { animate: false });
+                // Move the focal point upward into the visible area above the drawer.
+                map.panBy([0, Math.round(drawerOcclusion / 2)], { animate: false });
             }
         }
 
@@ -920,25 +1011,39 @@
                 return;
             }
 
-            if (map && options.focusMap !== false) {
+            const recenterPointInVisibleArea = () => {
+                if (!map) {
+                    return;
+                }
                 setViewVisible([point.latitude, point.longitude], Math.max(map.getZoom() || 0, 16), {
                     includeCollapsedDrawer: true,
                 });
+            };
+
+            if (map && options.focusMap !== false) {
+                recenterPointInVisibleArea();
             }
 
             const marker = point.puid ? renderedPointMarkersById.get(point.puid) : null;
             if (marker && marker.fire) {
                 marker.fire('click');
+                if (options.focusMap !== false) {
+                    setTimeout(recenterPointInVisibleArea, 120);
+                }
                 return;
             }
 
             if (map && L && L.popup) {
+                const calculatedSpeedMph = getCalculatedSpeedMphAtIndex(rawPoints, selectedSegmentPointIndex);
                 const popupContent = point.puid
                     ? loadPopupContentforPoint(point.puid)
-                    : `<strong>${new Date(point.time).toLocaleString()}</strong><br>Latitude: ${point.latitude}<br>Longitude: ${point.longitude}`;
+                    : buildPointPopupContent(point, { calculatedSpeedMph });
                 L.popup([point.latitude, point.longitude], {
                     content: `<p>${popupContent}</p>`,
                 }).openOn(map);
+                if (options.focusMap !== false) {
+                    setTimeout(recenterPointInVisibleArea, 120);
+                }
             }
         }
 
@@ -1199,6 +1304,21 @@
                 return basePoints;
             }
 
+            // Keep travel line strictly on travel points; stop connectors are rendered separately.
+            return basePoints.reduce((accumulator, point) => {
+                if (!accumulator.length || !isSameTrackPoint(accumulator[accumulator.length - 1], point)) {
+                    accumulator.push(point);
+                }
+                return accumulator;
+            }, []);
+        }
+
+        function getTravelStopConnectorPairs(segment) {
+            const travelPoints = Array.isArray(segment && segment.rawPoints) ? segment.rawPoints.filter(Boolean) : [];
+            if (!segment || segment.type !== 'travel' || !travelPoints.length) {
+                return [];
+            }
+
             const timelineSegments = detectedSegments
                 .filter((entry) =>
                     entry &&
@@ -1220,32 +1340,266 @@
 
             const currentIndex = timelineSegments.findIndex((entry) => entry.id === segment.id);
             if (currentIndex < 0) {
-                return basePoints;
+                return [];
             }
 
-            let renderPoints = basePoints.slice();
+            const connectorPairs = [];
+
             const previousSegment = timelineSegments[currentIndex - 1];
             if (previousSegment && previousSegment.type === 'stop') {
                 const previousStopPoints = Array.isArray(previousSegment.rawPoints) ? previousSegment.rawPoints.filter(Boolean) : [];
-                if (previousStopPoints.length) {
-                    renderPoints = [previousStopPoints[previousStopPoints.length - 1]].concat(renderPoints);
+                const stopPointInsideRadius = previousStopPoints.length ? previousStopPoints[previousStopPoints.length - 1] : null;
+                const travelStartPoint = travelPoints[0] || null;
+                if (stopPointInsideRadius && travelStartPoint && !isSameTrackPoint(stopPointInsideRadius, travelStartPoint)) {
+                    connectorPairs.push([travelStartPoint, stopPointInsideRadius]);
                 }
             }
 
             const nextSegment = timelineSegments[currentIndex + 1];
             if (nextSegment && nextSegment.type === 'stop') {
                 const nextStopPoints = Array.isArray(nextSegment.rawPoints) ? nextSegment.rawPoints.filter(Boolean) : [];
-                if (nextStopPoints.length) {
-                    renderPoints = renderPoints.concat(nextStopPoints[0]);
+                const stopPointInsideRadius = nextStopPoints.length ? nextStopPoints[0] : null;
+                const travelEndPoint = travelPoints[travelPoints.length - 1] || null;
+                if (stopPointInsideRadius && travelEndPoint && !isSameTrackPoint(stopPointInsideRadius, travelEndPoint)) {
+                    connectorPairs.push([travelEndPoint, stopPointInsideRadius]);
                 }
             }
 
-            return renderPoints.reduce((accumulator, point) => {
-                if (!accumulator.length || !isSameTrackPoint(accumulator[accumulator.length - 1], point)) {
-                    accumulator.push(point);
+            return connectorPairs;
+        }
+
+        function createTravelStopConnectorLayer(segment, color, options = {}) {
+            const connectorPairs = getTravelStopConnectorPairs(segment);
+            if (!connectorPairs.length || !transitionGroup) {
+                return [];
+            }
+
+            const isHighlighted = Boolean(options && options.highlighted);
+            const connectorColor = isHighlighted ? '#ff3b30' : color;
+            const connectorRadius = isHighlighted ? 2.2 : 1.6;
+            const connectorOpacity = isHighlighted ? 1 : 0.94;
+
+            const buildConnectorDots = (fromPoint, toPoint) => {
+                if (!fromPoint || !toPoint) {
+                    return [];
                 }
-                return accumulator;
-            }, []);
+
+                const totalDistanceMeters = calculateDistance(
+                    fromPoint.latitude,
+                    fromPoint.longitude,
+                    toPoint.latitude,
+                    toPoint.longitude,
+                    'meters'
+                );
+
+                if (!Number.isFinite(totalDistanceMeters) || totalDistanceMeters <= 0.5) {
+                    return [[fromPoint.latitude, fromPoint.longitude]];
+                }
+
+                const dotSpacingMeters = 6;
+                const dotCount = Math.max(2, Math.ceil(totalDistanceMeters / dotSpacingMeters) + 1);
+                const dots = [];
+                for (let index = 0; index < dotCount; index++) {
+                    const ratio = dotCount === 1 ? 0 : index / (dotCount - 1);
+                    dots.push([
+                        fromPoint.latitude + ((toPoint.latitude - fromPoint.latitude) * ratio),
+                        fromPoint.longitude + ((toPoint.longitude - fromPoint.longitude) * ratio),
+                    ]);
+                }
+                return dots;
+            };
+
+            const connectorLayers = [];
+            connectorPairs.forEach((pair) => {
+                const fromPoint = pair[0];
+                const toPoint = pair[1];
+                const connectorDots = buildConnectorDots(fromPoint, toPoint);
+                connectorDots.forEach((latLng) => {
+                    const dot = L.circleMarker(latLng, {
+                        color,
+                        fillColor: connectorColor,
+                        fillOpacity: connectorOpacity,
+                        opacity: connectorOpacity,
+                        radius: connectorRadius,
+                        weight: 0,
+                        stroke: false,
+                        interactive: false,
+                    }).addTo(transitionGroup);
+                    dot._jpBaseStyle = {
+                        color,
+                        fillColor: connectorColor,
+                        fillOpacity: connectorOpacity,
+                        opacity: connectorOpacity,
+                        radius: connectorRadius,
+                        weight: 0,
+                        stroke: false,
+                    };
+                    segmentLayers.push(dot);
+                    connectorLayers.push(dot);
+                });
+            });
+
+            return connectorLayers;
+        }
+
+        function speedColorFromMph(speedMph) {
+            const safeSpeed = Number.isFinite(speedMph) ? speedMph : 10;
+            const speedAnchors = [
+                { mph: 10, rgb: [126, 34, 206] }, // purple
+                { mph: 25, rgb: [37, 99, 235] },  // blue
+                { mph: 35, rgb: [22, 163, 74] },  // green
+                { mph: 45, rgb: [234, 179, 8] },  // yellow
+                { mph: 55, rgb: [249, 115, 22] }, // orange
+                { mph: 60, rgb: [220, 38, 38] },  // red
+            ];
+
+            if (safeSpeed <= speedAnchors[0].mph) {
+                return `rgb(${speedAnchors[0].rgb.join(',')})`;
+            }
+            if (safeSpeed >= speedAnchors[speedAnchors.length - 1].mph) {
+                return `rgb(${speedAnchors[speedAnchors.length - 1].rgb.join(',')})`;
+            }
+
+            for (let index = 1; index < speedAnchors.length; index++) {
+                const lower = speedAnchors[index - 1];
+                const upper = speedAnchors[index];
+                if (safeSpeed <= upper.mph) {
+                    const ratio = Math.max(0, Math.min(1, (safeSpeed - lower.mph) / (upper.mph - lower.mph)));
+                    const interpolatedRgb = [0, 1, 2].map((channel) => Math.round(lower.rgb[channel] + ((upper.rgb[channel] - lower.rgb[channel]) * ratio)));
+                    return `rgb(${interpolatedRgb.join(',')})`;
+                }
+            }
+
+            return 'rgb(220,38,38)';
+        }
+
+        function estimatePairSpeedMph(fromPoint, toPoint) {
+            const fromTime = fromPoint && fromPoint.time ? new Date(fromPoint.time).getTime() : null;
+            const toTime = toPoint && toPoint.time ? new Date(toPoint.time).getTime() : null;
+            if (!Number.isFinite(fromTime) || !Number.isFinite(toTime) || toTime <= fromTime) {
+                if (toPoint && Number.isFinite(Number(toPoint.velocity))) {
+                    const fallbackMph = Number(toPoint.velocity) * 2.23694;
+                    return Number.isFinite(fallbackMph) ? fallbackMph : null;
+                }
+                return null;
+            }
+
+            const distanceMeters = calculateDistance(fromPoint.latitude, fromPoint.longitude, toPoint.latitude, toPoint.longitude, 'meters');
+            if (!Number.isFinite(distanceMeters)) {
+                return null;
+            }
+
+            const hours = (toTime - fromTime) / (1000 * 60 * 60);
+            if (!Number.isFinite(hours) || hours <= 0) {
+                return null;
+            }
+
+            const miles = distanceMeters / 1609.344;
+            return miles / hours;
+        }
+
+        function toMphFromGpsVelocity(gpsVelocity) {
+            const safeSpeed = Number(gpsVelocity);
+            if (!Number.isFinite(safeSpeed)) {
+                return null;
+            }
+            // Tracker payload velocity is reported in km/h; convert to mph for display.
+            return safeSpeed * 0.621371;
+        }
+
+        function formatSpeedMph(speedMph) {
+            return Number.isFinite(speedMph) ? `${speedMph.toFixed(1)} mph` : 'Unavailable';
+        }
+
+        function getSortedPointsByTime(pointsListOrMap) {
+            const pointsList = pointsListOrMap instanceof Map
+                ? Array.from(pointsListOrMap.values())
+                : (Array.isArray(pointsListOrMap) ? pointsListOrMap.slice() : []);
+            return pointsList
+                .filter(Boolean)
+                .sort((left, right) => new Date(left.time) - new Date(right.time));
+        }
+
+        function getCalculatedSpeedMphAtIndex(sortedPoints, pointIndex) {
+            if (!Array.isArray(sortedPoints) || sortedPoints.length < 2 || !Number.isFinite(pointIndex)) {
+                return null;
+            }
+
+            const safeIndex = Math.max(0, Math.min(pointIndex, sortedPoints.length - 1));
+            if (safeIndex > 0) {
+                const fromPrevious = estimatePairSpeedMph(sortedPoints[safeIndex - 1], sortedPoints[safeIndex]);
+                if (Number.isFinite(fromPrevious)) {
+                    return fromPrevious;
+                }
+            }
+
+            if (safeIndex < sortedPoints.length - 1) {
+                const toNext = estimatePairSpeedMph(sortedPoints[safeIndex], sortedPoints[safeIndex + 1]);
+                if (Number.isFinite(toNext)) {
+                    return toNext;
+                }
+            }
+
+            return null;
+        }
+
+        function buildPointPopupContent(point, options = {}) {
+            if (!point) {
+                return 'Point not found';
+            }
+
+            const gpsSpeedMph = toMphFromGpsVelocity(point.velocity);
+            const calculatedSpeedMph = Number.isFinite(options.calculatedSpeedMph) ? options.calculatedSpeedMph : null;
+            let result = '';
+
+            result += `<strong>${new Date(point.time).toLocaleString()}</strong><br>`;
+            result += `Latitude: ${point.latitude}<br>`;
+            result += `Longitude: ${point.longitude}<br>`;
+            result += `GPS speed: ${formatSpeedMph(gpsSpeedMph)}<br>`;
+            result += `Calc point-to-point speed: ${formatSpeedMph(calculatedSpeedMph)}<br>`;
+            result += `Course: ${point.course} degrees<br>`;
+            result += `Altitude: ${point.altitude}<br>`;
+            result += `Accuracy: ${point.gps_accuracy}<br>`;
+            result += `Battery: ${point.battery}%<br>`;
+            result += `Acceleration: ${point.acceleration}<br>`;
+            result += `Mode: ${point.mode}<br>`;
+            return result;
+        }
+
+        function drawSpeedColoredLineSegments(pointsList, lineColorFallback) {
+            const sortedPoints = Array.isArray(pointsList)
+                ? pointsList.filter(Boolean).sort((left, right) => new Date(left.time) - new Date(right.time))
+                : [];
+            if (sortedPoints.length < 2 || !linesGroup) {
+                return [];
+            }
+
+            const segmentLines = [];
+            for (let index = 1; index < sortedPoints.length; index++) {
+                const fromPoint = sortedPoints[index - 1];
+                const toPoint = sortedPoints[index];
+                if (!fromPoint || !toPoint) {
+                    continue;
+                }
+
+                const speedMph = estimatePairSpeedMph(fromPoint, toPoint);
+                const lineColor = Number.isFinite(speedMph)
+                    ? speedColorFromMph(speedMph)
+                    : lineColorFallback;
+                const line = L.polyline([
+                    [fromPoint.latitude, fromPoint.longitude],
+                    [toPoint.latitude, toPoint.longitude],
+                ], {
+                    color: lineColor,
+                    weight: 3.2,
+                    opacity: 0.95,
+                }).addTo(linesGroup);
+                line._jpBaseStyle = { color: lineColor, weight: 3.2, opacity: 0.95 };
+                segmentLayers.push(line);
+                segmentLines.push(line);
+            }
+
+            return segmentLines;
         }
 
         function highlightSegment(segmentId, options = {}) {
@@ -1268,6 +1622,7 @@
                 segment.polyline = L.polyline(travelRenderPoints.map((point) => [point.latitude, point.longitude]), { color: trackerColor, weight: 2, opacity: 0.8 }).addTo(transitionGroup);
                 segment.polyline._jpBaseStyle = { color: trackerColor, weight: 2, opacity: 0.8 };
                 segmentLayers.push(segment.polyline);
+                segment.connectorPolylines = createTravelStopConnectorLayer(segment, trackerColor);
             }
 
             if (segment.type === 'stop' && (!Array.isArray(segment.stopRadiusCircles) || !segment.stopRadiusCircles.length)) {
@@ -1311,6 +1666,42 @@
                 segment.polyline.setStyle({ color: '#ff3b30', weight: 5, opacity: 1 });
                 if (focusMap && segment.polyline.getBounds) {
                     fitBoundsVisible(segment.polyline.getBounds());
+                }
+            }
+            if (segment.type === 'travel') {
+                const connectorPolylines = Array.isArray(segment.connectorPolylines)
+                    ? segment.connectorPolylines
+                    : [];
+                if (!connectorPolylines.length) {
+                    const trackerColor = getTrackerColor(segment.trackerId);
+                    segment.connectorPolylines = createTravelStopConnectorLayer(segment, trackerColor, { highlighted: true });
+                } else {
+                    connectorPolylines.forEach((connectorLine) => {
+                        if (connectorLine && connectorLine.setStyle) {
+                            const isDotMarker = typeof connectorLine.getLatLng === 'function' && typeof connectorLine.getLatLngs !== 'function';
+                            if (isDotMarker) {
+                                connectorLine.setStyle({
+                                    color: '#ff3b30',
+                                    fillColor: '#ff3b30',
+                                    fillOpacity: 1,
+                                    opacity: 1,
+                                    radius: 2.2,
+                                    weight: 0,
+                                    stroke: false,
+                                });
+                            } else {
+                                connectorLine.setStyle({
+                                    color: '#ff3b30',
+                                    weight: 4.2,
+                                    opacity: 0.98,
+                                    dashArray: '1,10',
+                                    lineCap: 'round',
+                                    lineJoin: 'round',
+                                    renderer: L.svg(),
+                                });
+                            }
+                        }
+                    });
                 }
             }
             if (segment.points) {
@@ -1435,6 +1826,7 @@
                 month: 'short',
                 day: 'numeric',
             });
+            const includeWeekday = Boolean(options.includeWeekday);
             const nowDate = options.nowDate instanceof Date ? options.nowDate : new Date();
             const startIsToday = Number.isFinite(nowDate.getTime()) && startDate.toDateString() === nowDate.toDateString();
             const includeDateForNonToday = Boolean(options.includeDateForNonToday) && !startIsToday;
@@ -1444,9 +1836,15 @@
                 window.matchMedia &&
                 window.matchMedia('(min-width: 769px)').matches
             );
-            const collapsedDateFormatter = includeWeekdayOnDesktop ? dateWithWeekdayFormatter : dateOnlyFormatter;
+            const collapsedDateFormatter = (includeWeekday || includeWeekdayOnDesktop) ? dateWithWeekdayFormatter : dateOnlyFormatter;
 
             if (options.includeDate === false) {
+                if (includeWeekday) {
+                    if (sameDay) {
+                        return `${dateWithWeekdayFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
+                    }
+                    return `${dateWithWeekdayFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${dateWithWeekdayFormatter.format(endDate)} ${timeFormatter.format(endDate)}`;
+                }
                 return `${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
             }
 
@@ -1458,15 +1856,28 @@
             }
 
             if (options.includeDateOnlyIfMultiDay && sameDay) {
+                if (includeWeekday) {
+                    return `${dateWithWeekdayFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
+                }
                 return `${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
             }
 
             if (options.includeDateOnlyIfMultiDay && !sameDay) {
+                if (includeWeekday) {
+                    return `${dateWithWeekdayFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${dateWithWeekdayFormatter.format(endDate)} ${timeFormatter.format(endDate)}`;
+                }
                 return `${dateOnlyFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${dateOnlyFormatter.format(endDate)} ${timeFormatter.format(endDate)}`;
             }
 
             if (sameDay) {
+                if (includeWeekday) {
+                    return `${dateWithWeekdayFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
+                }
                 return `${timeFormatter.format(startDate)} – ${timeFormatter.format(endDate)}`;
+            }
+
+            if (includeWeekday) {
+                return `${dateWithWeekdayFormatter.format(startDate)} ${timeFormatter.format(startDate)} – ${dateWithWeekdayFormatter.format(endDate)} ${timeFormatter.format(endDate)}`;
             }
 
             return `${datetimeFormatter.format(startDate)} – ${datetimeFormatter.format(endDate)}`;
@@ -1502,6 +1913,7 @@
                     includeDate: isCollapsed,
                     includeDateOnlyIfMultiDay: true,
                     includeDateForNonToday: isCollapsed,
+                    includeWeekday: true,
                     includeWeekdayOnDesktop: isCollapsed,
                 });
                 timeframe.textContent = `${activeSegment.type === 'stop' ? 'Stop' : 'Travel'} • ${formattedRange || 'Time range unavailable'}`;
@@ -1654,6 +2066,7 @@
             clearSegmentHighlight();
 
             if (points.size === 0) {
+                renderTrackerLegend();
                 restoreSelectedSegmentAfterRefresh(previousSelectedSegmentContext, preserveViewport);
                 return; // No points to display
             }
@@ -1684,6 +2097,7 @@
 
             points.forEach((trackerPoints, trackerId) => {
                 const color = getTrackerColor(trackerId);
+                const speedColorModeEnabled = isSpeedColoredLineModeEnabled() && trackerId === getCurrentSelectedTrackerId();
                 const trackerLinePoints = Array.from(trackerPoints.values()).filter((p) => {
                     if (settingsState.showIndividualPoints) {
                         return true;
@@ -1701,24 +2115,46 @@
 
                 var polyline = null;
                 if (settingsState.showIndividualPoints && trackerLinePoints.length >= 2) {
-                    polyline = L.polyline(trackerLinePoints.map((p) => [p.latitude, p.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
-                    polyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
-                    segmentLayers.push(polyline);
-                    if (!preserveViewport && polyline.getBounds) {
-                        extendViewportBounds(polyline.getBounds());
+                    if (speedColorModeEnabled) {
+                        const speedLines = drawSpeedColoredLineSegments(trackerLinePoints, color);
+                        if (speedLines.length) {
+                            polyline = L.featureGroup(speedLines);
+                            if (!preserveViewport) {
+                                extendViewportBounds(polyline.getBounds());
+                            }
+                        }
+                    } else {
+                        polyline = L.polyline(trackerLinePoints.map((p) => [p.latitude, p.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
+                        polyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
+                        segmentLayers.push(polyline);
+                        if (!preserveViewport && polyline.getBounds) {
+                            extendViewportBounds(polyline.getBounds());
+                        }
                     }
                 } else if (!settingsState.showIndividualPoints && trackerTravelSegments.length) {
                     const segmentPolylines = [];
-                    trackerTravelSegments.forEach((segment) => {
-                        const travelRenderPoints = getTravelRenderPoints(segment);
-                        if (travelRenderPoints.length < 2) {
-                            return;
+                    if (speedColorModeEnabled) {
+                        const speedLines = drawSpeedColoredLineSegments(trackerLinePoints, color);
+                        if (speedLines.length) {
+                            segmentPolylines.push(...speedLines);
                         }
-                        const segmentPolyline = L.polyline(travelRenderPoints.map((point) => [point.latitude, point.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
-                        segmentPolyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
-                        segmentLayers.push(segmentPolyline);
-                        segmentPolylines.push(segmentPolyline);
-                    });
+
+                        trackerTravelSegments.forEach((segment) => {
+                            segment.connectorPolylines = createTravelStopConnectorLayer(segment, color);
+                        });
+                    } else {
+                        trackerTravelSegments.forEach((segment) => {
+                            const travelRenderPoints = getTravelRenderPoints(segment);
+                            if (travelRenderPoints.length < 2) {
+                                return;
+                            }
+                            const segmentPolyline = L.polyline(travelRenderPoints.map((point) => [point.latitude, point.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
+                            segmentPolyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
+                            segmentLayers.push(segmentPolyline);
+                            segment.connectorPolylines = createTravelStopConnectorLayer(segment, color);
+                            segmentPolylines.push(segmentPolyline);
+                        });
+                    }
 
                     if (!preserveViewport && segmentPolylines.length) {
                         const segmentGroup = L.featureGroup(segmentPolylines);
@@ -1730,11 +2166,21 @@
                         : (segmentPolylines.length ? L.featureGroup(segmentPolylines) : null);
                 } else if (!settingsState.showIndividualPoints && trackerLinePoints.length >= 2) {
                     // Fallback for sparse/transition states where travel segmentation has not yielded drawable segments yet.
-                    polyline = L.polyline(trackerLinePoints.map((point) => [point.latitude, point.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
-                    polyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
-                    segmentLayers.push(polyline);
-                    if (!preserveViewport && polyline.getBounds) {
-                        extendViewportBounds(polyline.getBounds());
+                    if (speedColorModeEnabled) {
+                        const speedLines = drawSpeedColoredLineSegments(trackerLinePoints, color);
+                        if (speedLines.length) {
+                            polyline = L.featureGroup(speedLines);
+                            if (!preserveViewport) {
+                                extendViewportBounds(polyline.getBounds());
+                            }
+                        }
+                    } else {
+                        polyline = L.polyline(trackerLinePoints.map((point) => [point.latitude, point.longitude]), { color, weight: 2, opacity: 0.8 }).addTo(linesGroup);
+                        polyline._jpBaseStyle = { color, weight: 2, opacity: 0.8 };
+                        segmentLayers.push(polyline);
+                        if (!preserveViewport && polyline.getBounds) {
+                            extendViewportBounds(polyline.getBounds());
+                        }
                     }
                 }
 
@@ -1787,33 +2233,40 @@
             }
 
             refreshLiveMarkers({ mergeIntoTrackLines: false });
+            renderTrackerLegend();
 
             restoreSelectedSegmentAfterRefresh(previousSelectedSegmentContext, preserveViewport);
         }
 
         function loadPopupContentforPoint(pointPIUD) {
             let point;
+            let trackerPointsForPoint = null;
             points.forEach((trackerPoints) => {
                 if (trackerPoints.has(pointPIUD)) {
                     point = trackerPoints.get(pointPIUD);
+                    trackerPointsForPoint = trackerPoints;
                 }
             });
             if (!point) {
                 return "Point not found";
-            }   
-            var result = "";
+            }
 
-            result += "<strong>" + new Date(point.time).toLocaleString() + "</strong><br>";
-            result += "Latitude: " + point.latitude + "<br>";
-            result += "Longitude: " + point.longitude + "<br>";
-            result += "Velocity: " + point.velocity + "<br>";
-            result += "Course: " + point.course + " degrees<br>";
-            result += "Altitude: " + point.altitude + "<br>";
-            result += "Accuracy: " + point.gps_accuracy + "<br>";
-            result += "Battery: " + point.battery + "%<br>";
-            result += "Acceleration: " + point.acceleration + "<br>";
-            result += "Mode: " + point.mode + "<br>";
-            return result;
+            const sortedTrackerPoints = getSortedPointsByTime(trackerPointsForPoint);
+            const pointIndex = sortedTrackerPoints.findIndex((candidatePoint) => {
+                if (!candidatePoint) {
+                    return false;
+                }
+                if (candidatePoint.puid && point.puid) {
+                    return candidatePoint.puid === point.puid;
+                }
+                return (
+                    candidatePoint.time === point.time &&
+                    Number(candidatePoint.latitude) === Number(point.latitude) &&
+                    Number(candidatePoint.longitude) === Number(point.longitude)
+                );
+            });
+            const calculatedSpeedMph = getCalculatedSpeedMphAtIndex(sortedTrackerPoints, pointIndex);
+            return buildPointPopupContent(point, { calculatedSpeedMph });
 
         }
 
@@ -1890,6 +2343,8 @@
                 syncPickerRangeToNowPreservingWindow();
                 activeSearchFollowsNow = true;
             }
+
+            updateTimeframeIndicator();
 
             const effectiveRange = getEffectivePointsTimeRange();
             const startTimeSeconds = effectiveRange && effectiveRange.startDate
@@ -2759,16 +3214,16 @@
                 return;
             }
             if (!trackers.length) {
-                container.innerHTML = "<div style='font-size: 12px; color: #666;'>No trackers loaded yet.</div>";
+                container.innerHTML = "<div class='tracker-color-empty'>No trackers loaded yet.</div>";
                 renderTrackerLegend();
                 return;
             }
 
             container.innerHTML = trackers.map((trackerId) => {
                 const color = getTrackerColor(trackerId);
-                return `<label style='display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px;'>
-                    <span style='flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;'>${trackerId}</span>
-                    <input type='color' value='${color}' data-tracker-id='${trackerId}' onchange='updateTrackerColor(this.getAttribute("data-tracker-id"), this.value); saveSettings(); refreshPoints();' />
+                return `<label class='tracker-color-chip'>
+                    <span class='tracker-color-label'>${trackerId}</span>
+                    <input class='tracker-color-input' type='color' value='${color}' data-tracker-id='${trackerId}' onchange='updateTrackerColor(this.getAttribute("data-tracker-id"), this.value); saveSettings(); refreshPoints();' />
                 </label>`;
             }).join('');
 
@@ -2793,6 +3248,7 @@
             const activeLegendTrackers = legendTrackerCandidates
                 .filter((trackerId) => Boolean(trackerId) && trackerId !== 'all_trackers')
                 .sort((left, right) => String(left).localeCompare(String(right)));
+            const speedColorModeEnabled = isSpeedColoredLineModeEnabled();
 
             const trackerRows = activeLegendTrackers.length
                 ? activeLegendTrackers.map((trackerId) => {
@@ -2805,6 +3261,36 @@
                     </button>`;
                 }).join('')
                 : "<div class='tracker-legend-empty'>No tracker lines in current results.</div>";
+
+            const speedColorLegend = speedColorModeEnabled
+                ? `<div class='tracker-legend-section'>
+                    <div class='tracker-legend-title'>Speed Color Scale</div>
+                    <div class='tracker-legend-substatus'>Single tracker mode: line color maps estimated speed between points.</div>
+                    <div class='tracker-legend-speed-scale'>
+                        <div class='tracker-legend-speed-gradient'></div>
+                        <div class='tracker-legend-speed-ticks'>
+                            <span style='left:0%; background: rgb(126, 34, 206);'></span>
+                            <span style='left:30%; background: rgb(37, 99, 235);'></span>
+                            <span style='left:50%; background: rgb(22, 163, 74);'></span>
+                            <span style='left:70%; background: rgb(234, 179, 8);'></span>
+                            <span style='left:90%; background: rgb(249, 115, 22);'></span>
+                            <span style='left:100%; background: rgb(220, 38, 38);'></span>
+                        </div>
+                        <div class='tracker-legend-speed-stops'>
+                            <span style='left:0%; color: rgb(126, 34, 206); transform: translateX(0);'>10 mph</span>
+                            <span style='left:30%; color: rgb(37, 99, 235);'>25 mph</span>
+                            <span style='left:50%; color: rgb(22, 163, 74);'>35 mph</span>
+                            <span style='left:70%; color: rgb(234, 179, 8);'>45 mph</span>
+                            <span style='left:90%; color: rgb(249, 115, 22);'>55 mph</span>
+                            <span style='left:100%; color: rgb(220, 38, 38); transform: translateX(-100%);'>60+</span>
+                        </div>
+                    </div>
+                </div>`
+                : '';
+
+            const accuracyNote = accuracyFilteredPointCount > 0
+                ? `<div class='tracker-legend-section'><div class='tracker-legend-title'>Accuracy Filter</div><div class='tracker-legend-substatus'>Skipped ${accuracyFilteredPointCount} point${accuracyFilteredPointCount === 1 ? '' : 's'} due to the accuracy limit.</div></div>`
+                : '';
 
             container.innerHTML = `
                 <div class='tracker-legend-section'>
@@ -2832,6 +3318,8 @@
                     <div class='tracker-legend-substatus'>Visible line trackers: ${activeLegendTrackers.length}</div>
                     <div class='tracker-legend-substatus'>Known trackers: ${trackers.length}</div>
                 </div>
+                ${speedColorLegend}
+                ${accuracyNote}
             `;
         }
 
@@ -2845,6 +3333,7 @@
             const collapsed = legend.classList.toggle('collapsed');
             button.textContent = collapsed ? 'Show' : 'Hide';
             button.setAttribute('aria-expanded', String(!collapsed));
+            updateTimeframeIndicator();
         }
 
         function toggleTrackerLegendItem(encodedTrackerId) {
@@ -2900,12 +3389,18 @@
             }
             trackers = Array.isArray(allTrackers) ? allTrackers : [];
             const savedSettings = loadSettings();
+            const stateTrackerId = settingsState && settingsState.trackerId;
             const queryTrackerId = new URLSearchParams(window.location.search).get('tracker_id');
-            const existingSelectedTracker = document.getElementById("selTrackers").value;
-            const previouslySelectedTracker = existingSelectedTracker || (savedSettings && savedSettings.trackerId) || queryTrackerId || "";
-            const selectedTrackerId = previouslySelectedTracker || "all_trackers";
             
             const selTrackers = document.getElementById("selTrackers");
+            const currentSelectedTrackerId = selTrackers && selTrackers.value
+                ? selTrackers.value
+                : "";
+            const selectedTrackerId = currentSelectedTrackerId
+                || stateTrackerId
+                || (savedSettings && savedSettings.trackerId)
+                || queryTrackerId
+                || "all_trackers";
             selTrackers.innerHTML = ""; // Clear existing options
 
             let option = document.createElement("option");
@@ -2993,6 +3488,35 @@
 
         function toggleSegmentDrawerFromButton() {
             toggleSegmentDrawer();
+        }
+
+        function setSegmentDebugVisibility(visible) {
+            const drawer = document.getElementById('segmentDrawer');
+            const debugToggleButton = document.getElementById('segmentDebugToggleButton');
+            if (!drawer || !debugToggleButton) {
+                return;
+            }
+
+            drawer.classList.toggle('debug-visible', Boolean(visible));
+            debugToggleButton.textContent = visible ? 'Hide Debug' : 'Show Debug';
+            debugToggleButton.setAttribute('aria-pressed', String(Boolean(visible)));
+            debugToggleButton.setAttribute('title', visible
+                ? 'Hide point navigation and copy controls'
+                : 'Show point navigation and copy controls');
+
+            if (map && map.invalidateSize) {
+                setTimeout(() => map.invalidateSize(), 50);
+            }
+        }
+
+        function toggleSegmentDebugVisibility() {
+            const drawer = document.getElementById('segmentDrawer');
+            if (!drawer) {
+                return;
+            }
+            const currentlyVisible = drawer.classList.contains('debug-visible');
+            setSegmentDebugVisibility(!currentlyVisible);
+            updateSegmentDebugControls();
         }
 
         let segmentDrawerDragStartY = null;
@@ -3128,7 +3652,10 @@
 
             picker.on('apply.daterangepicker', function() {
                 saveSettings();
+                updateTimeframeIndicator();
             });
+
+            updateTimeframeIndicator();
         }
 
         function loadTrackers() {
@@ -3315,6 +3842,7 @@
             startupSettingsSnapshot = loadSettings();
             applySettingsToForm(startupSettingsSnapshot);
             updateManualUpdateWatcherFromUi();
+            setSegmentDebugVisibility(false);
 
             const ensureMapReady = () => {
                 if (!map) {
@@ -3358,8 +3886,11 @@
                 return;
             }
 
-            $('#sel_datetimes').data('daterangepicker').setStartDate(moment().subtract(inputX, 'days').startOf('day'));
-            $('#sel_datetimes').data('daterangepicker').setEndDate(moment().subtract(inputX-1, 'days').startOf('day'));
+            const targetDay = moment().subtract(inputX, 'days');
+            $('#sel_datetimes').data('daterangepicker').setStartDate(targetDay.clone().startOf('day'));
+            $('#sel_datetimes').data('daterangepicker').setEndDate(targetDay.clone().endOf('day'));
+
+            updateTimeframeIndicator();
 
             refreshPoints();
         }
@@ -3377,6 +3908,8 @@
             $('#sel_datetimes').data('daterangepicker').setStartDate(moment().subtract(inputX-1, 'days').startOf('day'));
             $('#sel_datetimes').data('daterangepicker').setEndDate(moment());
 
+            updateTimeframeIndicator();
+
             refreshPoints();
         }
 
@@ -3392,6 +3925,8 @@
 
             $('#sel_datetimes').data('daterangepicker').setStartDate(moment().subtract(inputX-1, 'hours').startOf('hour'));
             $('#sel_datetimes').data('daterangepicker').setEndDate(moment());
+
+            updateTimeframeIndicator();
 
             refreshPoints();
         }
@@ -3478,24 +4013,47 @@
         }
 
         .tracker-color-controls {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
-            gap: 8px;
-            margin-top: 12px;
+            display: grid;
+            gap: 10px;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
             width: 100%;
         }
 
-        .tracker-color-controls label {
+        .tracker-color-empty {
+            font-size: 12px;
+            color: #64748b;
+        }
+
+        .tracker-color-chip {
             display: inline-flex;
             align-items: center;
-            gap: 6px;
-            padding: 4px 8px;
-            border: 1px solid #ddd;
-            border-radius: 6px;
+            justify-content: space-between;
+            gap: 10px;
+            border: 1px solid #d9e0ea;
+            border-radius: 10px;
+            background: #f8fafc;
+            min-height: 40px;
+            padding: 6px 10px;
+            width: 100%;
+        }
+
+        .tracker-color-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: #1e293b;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .tracker-color-input {
+            width: 44px;
+            height: 28px;
+            border-radius: 8px;
+            border: 1px solid #cbd5e1;
+            padding: 2px;
             background: #fff;
-            min-width: 220px;
-            justify-content: center;
+            cursor: pointer;
         }
 
         .live-tracker-marker {
@@ -3606,11 +4164,42 @@
             background: linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.94));
             border-bottom: 1px solid rgba(148, 163, 184, 0.28);
         }
-        .tracker-legend-header span {
+        .tracker-legend-title-wrap {
+            min-width: 0;
+            display: grid;
+            gap: 2px;
+        }
+        .tracker-legend-title {
             font-size: 12px;
             font-weight: 700;
             letter-spacing: 0.02em;
             color: #0f172a;
+        }
+        .legend-timeframe-indicator {
+            font-size: 11px;
+            font-weight: 600;
+            color: #334155;
+            letter-spacing: 0.01em;
+            max-width: min(250px, 100%);
+            line-height: 1.2;
+            display: grid;
+            gap: 1px;
+        }
+        .legend-timeframe-line {
+            display: grid;
+            grid-template-columns: 34px minmax(0, 1fr);
+            column-gap: 6px;
+            align-items: baseline;
+        }
+        .legend-timeframe-prefix {
+            color: #64748b;
+            font-weight: 700;
+            text-transform: none;
+        }
+        .legend-timeframe-value {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
         .tracker-legend-toggle {
             border: 1px solid #d0d7de;
@@ -3745,6 +4334,59 @@
             color: #64748b;
             margin-bottom: 2px;
         }
+        .tracker-legend-speed-scale {
+            position: relative;
+            margin-top: 6px;
+            padding-bottom: 18px;
+        }
+        .tracker-legend-speed-gradient {
+            height: 8px;
+            border-radius: 999px;
+            border: 1px solid rgba(15, 23, 42, 0.2);
+            background: linear-gradient(
+                90deg,
+                rgb(126, 34, 206) 0%,
+                rgb(37, 99, 235) 30%,
+                rgb(22, 163, 74) 50%,
+                rgb(234, 179, 8) 70%,
+                rgb(249, 115, 22) 90%,
+                rgb(220, 38, 38) 100%
+            );
+        }
+        .tracker-legend-speed-ticks {
+            position: absolute;
+            top: -4px;
+            left: 0;
+            right: 0;
+            height: 14px;
+            pointer-events: none;
+        }
+        .tracker-legend-speed-ticks span {
+            position: absolute;
+            top: 0;
+            width: 2px;
+            height: 14px;
+            transform: translateX(-1px);
+            border-radius: 2px;
+            box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.65);
+        }
+        .tracker-legend-speed-stops {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 14px;
+            height: 16px;
+            font-size: 10px;
+            font-variant-numeric: tabular-nums;
+            pointer-events: none;
+        }
+        .tracker-legend-speed-stops span {
+            position: absolute;
+            transform: translateX(-50%);
+            font-weight: 700;
+            white-space: nowrap;
+            text-shadow: 0 1px 0 rgba(255, 255, 255, 0.7);
+        }
         .performance-mode-status {
             display: block;
             margin-top: 4px;
@@ -3760,10 +4402,9 @@
             display: none;
         }
         .live-tracker-settings-group {
-            grid-column: 1 / -1;
             display: grid;
             gap: 8px;
-            padding: 10px 12px;
+            padding: 12px;
             border: 1px solid rgba(148, 163, 184, 0.35);
             border-radius: 12px;
             background: linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.96));
@@ -3778,7 +4419,7 @@
             gap: 10px;
         }
         .live-tracker-settings-title {
-            font-size: 13px;
+            font-size: 14px;
             font-weight: 700;
             color: #0f172a;
         }
@@ -3802,9 +4443,9 @@
             inset: 0;
             z-index: 30;
             display: none;
-            align-items: flex-start;
+            align-items: center;
             justify-content: center;
-            padding: 16px;
+            padding: clamp(8px, 2vh, 16px);
             background: rgba(15, 23, 42, 0.35);
             backdrop-filter: blur(2px);
         }
@@ -3812,40 +4453,171 @@
             display: flex;
         }
         .settings-card {
-            width: min(760px, 100%);
-            max-height: calc(100vh - 32px);
-            overflow: auto;
+            width: min(900px, 100%);
+            max-height: min(92vh, calc(100dvh - 16px));
+            overflow: hidden;
             background: #fff;
             border-radius: 16px;
             box-shadow: 0 12px 32px rgba(0,0,0,0.22);
-            padding: 16px;
+            display: flex;
+            flex-direction: column;
         }
         .settings-card-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 12px;
-            margin-bottom: 12px;
+            padding: 16px;
+            border-bottom: 1px solid #d9e0ea;
+            background: linear-gradient(180deg, #ffffff, #fbfdff);
         }
         .settings-card-header h2 {
             margin: 0;
             font-size: 18px;
         }
-        .settings-card .map-controls {
+        .settings-header-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .settings-card-content {
+            display: grid;
+            gap: 12px;
+            padding: 14px;
+            overflow: auto;
+            min-height: 0;
+        }
+
+        .settings-section {
+            border: 1px solid #d9e0ea;
+            border-radius: 12px;
+            background: #fff;
+            padding: 12px;
+        }
+
+        .settings-section-title {
+            margin: 0 0 10px;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            color: #334155;
+            text-transform: uppercase;
+        }
+
+        .settings-help {
+            margin: 2px 0 0;
+            font-size: 11px;
+            color: #64748b;
+            line-height: 1.35;
+        }
+
+        .settings-grid {
             display: grid;
             gap: 10px;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            align-items: start;
         }
-        .settings-card .map-controls label,
-        .settings-card .map-controls input,
-        .settings-card .map-controls select,
-        .settings-card .map-controls button {
+
+        .settings-grid.time-top {
+            grid-template-columns: 2fr 1fr;
+        }
+        .settings-subgroup {
+            border: 1px dashed #d6deea;
+            border-radius: 10px;
+            background: #fbfdff;
+            padding: 10px;
+            margin-top: 10px;
+        }
+        .settings-subgroup-title {
+            margin: 0 0 8px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: #475569;
+        }
+
+        .settings-grid.time-quick,
+        .settings-grid.stop-grid,
+        .settings-grid.display-grid,
+        .settings-grid.live-grid {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+
+        .settings-grid.live-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .settings-grid.display-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .settings-field {
+            display: grid;
+            gap: 6px;
+            align-content: start;
+        }
+
+        .settings-field > span {
+            font-size: 13px;
+            font-weight: 600;
+            color: #334155;
+        }
+
+        .settings-field input,
+        .settings-field select {
             width: 100%;
-            max-width: none;
+            min-height: 38px;
+            border: 1px solid #cfd7e3;
+            border-radius: 10px;
+            background: #fff;
+            padding: 0 10px;
+            font-size: 14px;
+            color: #1f2937;
         }
-        .settings-card .map-controls label {
-            justify-content: flex-start;
+
+        .settings-toggle-row {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            border: 1px solid #d9e0ea;
+            border-radius: 10px;
+            background: #fff;
+            min-height: 40px;
+            padding: 8px 10px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #1f2937;
+        }
+
+        .settings-footer {
+            position: sticky;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 8px;
+            border-top: 1px solid #d9e0ea;
+            padding: 12px 14px;
+            background: rgba(255, 255, 255, 0.96);
+            backdrop-filter: blur(4px);
+        }
+
+        .settings-btn {
+            min-height: 38px;
+            border: 1px solid #d0d7de;
+            border-radius: 10px;
+            background: #fff;
+            color: #334155;
+            font-size: 14px;
+            font-weight: 700;
+            padding: 0 14px;
+            cursor: pointer;
+        }
+
+        .settings-btn.primary {
+            background: #2563eb;
+            border-color: #2563eb;
+            color: #fff;
         }
         .segment-drawer {
             position: fixed;
@@ -3865,6 +4637,9 @@
         .segment-drawer.collapsed {
             height: 86px;
         }
+        .segment-drawer.collapsed.debug-visible {
+            height: 172px;
+        }
         .segment-drawer.expanded {
             height: min(72vh, 560px);
         }
@@ -3881,6 +4656,9 @@
             user-select: none;
             background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(248,250,252,0.96));
             border-top: 1px solid rgba(148, 163, 184, 0.25);
+            position: relative;
+            z-index: 2;
+            flex: 0 0 auto;
         }
         .segment-drawer-grabber {
             width: 54px;
@@ -3934,6 +4712,11 @@
             min-height: 0;
             overflow: auto;
             display: block;
+            position: relative;
+            z-index: 1;
+        }
+        .segment-drawer.debug-visible .segment-drawer-body {
+            padding-top: 10px;
         }
         .segment-drawer.collapsed .segment-drawer-body {
             display: none;
@@ -3959,6 +4742,18 @@
             gap: 6px;
             width: 100%;
             margin-top: 2px;
+        }
+        .segment-debug-toggle {
+            border: 1px solid #d0d7de;
+            border-radius: 999px;
+            background: #fff;
+            color: #334155;
+            font-size: 11px;
+            font-weight: 700;
+            min-height: 26px;
+            padding: 2px 10px;
+            cursor: pointer;
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
         }
         .segment-debug-controls button {
             border: 1px solid #d0d7de;
@@ -4003,8 +4798,11 @@
         .segment-drawer.collapsed .segment-nav {
             margin-bottom: 0;
         }
-        .segment-drawer.collapsed .segment-debug-controls,
-        .segment-drawer.collapsed .segment-debug-status {
+        .segment-drawer:not(.debug-visible) .segment-debug-controls,
+        .segment-drawer:not(.debug-visible) .segment-debug-status {
+            display: none;
+        }
+        .segment-drawer.collapsed:not(.debug-visible) .segment-debug-toggle {
             display: none;
         }
         @media (max-width: 900px) {
@@ -4026,7 +4824,25 @@
                 order: -1;
             }
             .settings-card {
+                width: min(900px, 100%);
+                max-height: calc(100dvh - 12px);
+            }
+            .settings-card-header {
                 padding: 12px;
+            }
+            .settings-header-actions {
+                gap: 6px;
+            }
+            .settings-card-content {
+                padding: 10px;
+                gap: 10px;
+            }
+            .settings-grid.time-top,
+            .settings-grid.time-quick,
+            .settings-grid.stop-grid,
+            .settings-grid.display-grid,
+            .settings-grid.live-grid {
+                grid-template-columns: 1fr;
             }
             .segment-drawer-handle {
                 display: grid;
@@ -4034,6 +4850,7 @@
                 grid-template-areas:
                     "mode nav toggle"
                     "time time time"
+                    "debugtoggle debugtoggle debugtoggle"
                     "debug debug debug"
                     "grabber grabber grabber";
                 align-items: center;
@@ -4042,6 +4859,12 @@
                 column-gap: 8px;
                 min-height: 82px;
                 padding: 8px 10px 10px;
+            }
+            .segment-drawer.expanded .segment-drawer-body {
+                padding-top: 8px;
+            }
+            .segment-drawer.expanded.debug-visible .segment-drawer-body {
+                padding-top: 16px;
             }
             .segment-nav-mode {
                 position: static;
@@ -4065,6 +4888,9 @@
                 text-align: center;
                 margin-top: 0;
             }
+            .segment-debug-toggle {
+                grid-area: debugtoggle;
+            }
             .segment-debug-controls {
                 grid-area: debug;
                 margin-top: 0;
@@ -4076,6 +4902,9 @@
             .segment-drawer.expanded {
                 height: min(78vh, 620px);
             }
+            .segment-drawer.collapsed.debug-visible {
+                height: 236px;
+            }
         }
     </style>
 
@@ -4085,10 +4914,22 @@
 <BODY>
     <div id="mapShell">
         <div id="theMap"></div>
-        <div id="trackerLegend" class="tracker-legend">
+        <div id="trackerLegend" class="tracker-legend collapsed">
             <div class="tracker-legend-header">
-                <span>Map Legend</span>
-                <button type="button" id="trackerLegendToggle" class="tracker-legend-toggle" onclick="toggleTrackerLegend()" aria-expanded="true">Hide</button>
+                <div class="tracker-legend-title-wrap">
+                    <span class="tracker-legend-title">Map Legend</span>
+                    <div id="legendTimeframeIndicator" class="legend-timeframe-indicator">
+                        <span class="legend-timeframe-line">
+                            <span id="legendTimeframeStartPrefix" class="legend-timeframe-prefix">From</span>
+                            <span id="legendTimeframeStartValue" class="legend-timeframe-value">Timeframe unavailable</span>
+                        </span>
+                        <span class="legend-timeframe-line">
+                            <span id="legendTimeframeEndPrefix" class="legend-timeframe-prefix"></span>
+                            <span id="legendTimeframeEndValue" class="legend-timeframe-value"></span>
+                        </span>
+                    </div>
+                </div>
+                <button type="button" id="trackerLegendToggle" class="tracker-legend-toggle" onclick="toggleTrackerLegend()" aria-expanded="false">Show</button>
             </div>
             <div id="trackerLegendBody" class="tracker-legend-body"></div>
         </div>
@@ -4098,38 +4939,63 @@
             <div class="settings-card" onclick="event.stopPropagation()">
                 <div class="settings-card-header">
                     <h2>Map Settings</h2>
-                    <button type="button" onclick="closeSettingsOverlay()">Close</button>
+                    <div class="settings-header-actions">
+                        <button type="button" class="settings-btn" onclick="closeSettingsOverlay()">Cancel</button>
+                        <button type="button" class="settings-btn primary" onclick="saveSettings(); closeSettingsOverlay(); loadTrackersAndPoints()">Apply</button>
+                    </div>
                 </div>
-                <div class="quick-range-row">
-                    <label for="inp_quick_hours">Last X Hours
-                        <input id="inp_quick_hours" type="number" oninput="quickHoursUpdated(); saveSettings();">
-                    </label>
-                    <label for="inp_quick_days">Last X Days
-                        <input id="inp_quick_days" type="number" value="1" oninput="quickDaysUpdated(); saveSettings();">
-                    </label>
-                    <label for="inp_quick_days_ago">X Days Ago
-                        <input id="inp_quick_days_ago" type="number" oninput="quickDaysAgoUpdated(); saveSettings();">
-                    </label>
-                </div>
-                <div class="map-controls">
-                    <label for="sel_datetimes">Date range
-                        <input type="text" id="sel_datetimes" name="datetimes"/>
-                    </label>
-                    <label for="selTrackers">Tracker
-                        <select id="selTrackers" oninput="saveSettings({ source: 'tracker-select' }); updatePerformanceModeUi(); refreshPoints()"></select>
-                        <span id="performanceModeStatus" class="performance-mode-status hidden"></span>
-                    </label>
-                    <label for="accuracyFilterInput">Accuracy Limit
-                        <input id="accuracyFilterInput" type="number" value="150" oninput="saveSettings(); refreshPoints()">
-                    </label>
-                    <div id="liveTrackerSettingsGroup" class="live-tracker-settings-group">
+                <div class="settings-card-content">
+                    <section class="settings-section">
+                        <h3 class="settings-section-title">Date, Time, and Tracker</h3>
+                        <div class="settings-grid time-top">
+                            <label class="settings-field" for="sel_datetimes">
+                                <span>Date and time range</span>
+                                <input type="text" id="sel_datetimes" name="datetimes"/>
+                            </label>
+                            <label class="settings-field" for="selTrackers">
+                                <span>Selected tracker</span>
+                                <select id="selTrackers" oninput="saveSettings({ source: 'tracker-select' }); updatePerformanceModeUi(); renderTrackerLegend(); refreshPoints()"></select>
+                                <span id="performanceModeStatus" class="performance-mode-status hidden"></span>
+                            </label>
+                        </div>
+                        <div class="settings-subgroup">
+                            <div class="settings-subgroup-title">Quick Range Presets</div>
+                            <div class="settings-grid time-quick">
+                                <label class="settings-field" for="inp_quick_hours">
+                                    <span>Past hours</span>
+                                    <input id="inp_quick_hours" type="number" oninput="quickHoursUpdated(); saveSettings();">
+                                </label>
+                                <label class="settings-field" for="inp_quick_days">
+                                    <span>Past days</span>
+                                    <input id="inp_quick_days" type="number" value="1" oninput="quickDaysUpdated(); saveSettings();">
+                                </label>
+                                <label class="settings-field" for="inp_quick_days_ago">
+                                    <span>Single day (X days ago)</span>
+                                    <input id="inp_quick_days_ago" type="number" min="0" oninput="quickDaysAgoUpdated(); saveSettings();">
+                                    <span class="settings-help">Shows one full day: 12:00 AM to 11:59 PM.</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="settings-grid" style="margin-top: 10px;">
+                            <label class="settings-field" for="accuracyFilterInput">
+                                <span>Max allowable GPS accuracy (m)</span>
+                                <input id="accuracyFilterInput" type="number" value="150" oninput="saveSettings(); refreshPoints()">
+                                <span class="settings-help">Higher values allow less accurate GPS pings.</span>
+                            </label>
+                        </div>
+                    </section>
+
+                    <section class="settings-section">
+                        <h3 class="settings-section-title">Live Tracker Updates</h3>
+                        <div id="liveTrackerSettingsGroup" class="live-tracker-settings-group">
                         <div class="live-tracker-settings-header">
                             <div class="live-tracker-settings-title">Live Tracker Updates</div>
                             <div id="liveTrackerSettingsStatus" class="live-tracker-settings-status">Enabled via MQTT refresh every 30s</div>
                         </div>
-                        <div class="live-tracker-settings-help">MQTT refresh turns live tracker updates on. When refresh is off, live markers stay static and scope selection is disabled.</div>
-                        <div id="liveTrackerSettingsBody" class="live-tracker-settings-body">
-                            <label for="manualMqttIntervalSelect">MQTT Refresh Interval
+                        <div class="live-tracker-settings-help">Use MQTT refresh to keep live markers updated. When refresh is off, live markers stay static and scope selection is disabled.</div>
+                        <div id="liveTrackerSettingsBody" class="live-tracker-settings-body settings-grid live-grid">
+                            <label class="settings-field" for="manualMqttIntervalSelect">
+                                <span>Live refresh interval</span>
                                 <select id="manualMqttIntervalSelect" oninput="saveSettings(); updateManualUpdateWatcherFromUi()">
                                     <option value="10">Every 10s</option>
                                     <option value="30" selected>Every 30s</option>
@@ -4140,36 +5006,66 @@
                                     <option value="0">Off</option>
                                 </select>
                             </label>
-                            <label for="liveTrackerScopeSelect">Live Tracker Scope
+                            <label class="settings-field" for="liveTrackerScopeSelect">
+                                <span>Live marker scope</span>
                                 <select id="liveTrackerScopeSelect" oninput="saveSettings(); refreshLiveMarkers()">
-                                    <option value="current">Current tracker only</option>
-                                    <option value="all">All trackers in DB</option>
+                                    <option value="current">Selected tracker only</option>
+                                    <option value="all">All trackers</option>
                                 </select>
                             </label>
                         </div>
-                    </div>
-                    <label for="stopDetectionRadiusInput">Stop Radius (m)
-                        <input id="stopDetectionRadiusInput" type="number" value="125" min="1" oninput="saveSettings(); refreshPoints()">
-                    </label>
-                    <label for="stopDetectionMinSecondsInput">Min Stop (s)
-                        <input id="stopDetectionMinSecondsInput" type="number" value="180" min="1" oninput="saveSettings(); refreshPoints()">
-                    </label>
-                    <label for="stopDetectionWindowPointsInput">Window Points
-                        <input id="stopDetectionWindowPointsInput" type="number" value="6" min="1" oninput="saveSettings(); refreshPoints()">
-                    </label>
-                    <label for="stopDetectionExitPointsInput">Exit Tolerance
-                        <input id="stopDetectionExitPointsInput" type="number" value="3" min="1" oninput="saveSettings(); refreshPoints()">
-                    </label>
-                    <label for="stopDetectionSampleIntervalSecondsInput">Sample Every (s)
-                        <input id="stopDetectionSampleIntervalSecondsInput" type="number" value="30" min="1" oninput="saveSettings(); refreshPoints()">
-                    </label>
-                    <label for="showIndividualPointsToggle" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; background: #fff; min-height: 38px;">
-                        <input id="showIndividualPointsToggle" type="checkbox" checked onchange="settingsState.showIndividualPoints = this.checked; saveSettings(); refreshPoints();">
-                        Show points
-                    </label>
-                    <button type="button" id="btnSubmit" onclick="saveSettings(); closeSettingsOverlay(); loadTrackersAndPoints()">Apply</button>
+                        </div>
+                    </section>
+
+                    <section class="settings-section">
+                        <h3 class="settings-section-title">Stop Detection</h3>
+                        <div class="settings-grid stop-grid">
+                            <label class="settings-field" for="stopDetectionRadiusInput">
+                                <span>Stop radius (m)</span>
+                                <input id="stopDetectionRadiusInput" type="number" value="125" min="1" oninput="saveSettings(); refreshPoints()">
+                            </label>
+                            <label class="settings-field" for="stopDetectionMinSecondsInput">
+                                <span>Minimum stop time (s)</span>
+                                <input id="stopDetectionMinSecondsInput" type="number" value="180" min="1" oninput="saveSettings(); refreshPoints()">
+                            </label>
+                            <label class="settings-field" for="stopDetectionWindowPointsInput">
+                                <span>Detection window points</span>
+                                <input id="stopDetectionWindowPointsInput" type="number" value="4" min="1" oninput="saveSettings(); refreshPoints()">
+                            </label>
+                            <label class="settings-field" for="stopDetectionExitPointsInput">
+                                <span>Exit confirmation points</span>
+                                <input id="stopDetectionExitPointsInput" type="number" value="3" min="1" oninput="saveSettings(); refreshPoints()">
+                            </label>
+                            <label class="settings-field" for="stopDetectionSampleIntervalSecondsInput">
+                                <span>Sample interval (s)</span>
+                                <input id="stopDetectionSampleIntervalSecondsInput" type="number" value="30" min="1" oninput="saveSettings(); refreshPoints()">
+                            </label>
+                        </div>
+                    </section>
+
+                    <section class="settings-section">
+                        <h3 class="settings-section-title">Map Display</h3>
+                        <div class="settings-grid display-grid">
+                            <label class="settings-toggle-row" for="showIndividualPointsToggle">
+                                <input id="showIndividualPointsToggle" type="checkbox" checked onchange="settingsState.showIndividualPoints = this.checked; saveSettings(); refreshPoints();">
+                                Show individual points
+                            </label>
+                            <label class="settings-toggle-row" for="speedColoredLineToggle">
+                                <input id="speedColoredLineToggle" type="checkbox" onchange="settingsState.speedColoredLineEnabled = this.checked; saveSettings(); refreshPoints();">
+                                Color line segments by estimated speed (10-70 mph).
+                            </label>
+                        </div>
+                    </section>
+
+                    <section class="settings-section">
+                        <h3 class="settings-section-title">Tracker Line Colors</h3>
+                        <div id="trackerColorControls" class="tracker-color-controls"></div>
+                    </section>
                 </div>
-                <div id="trackerColorControls" class="tracker-color-controls"></div>
+                <div class="settings-footer">
+                    <button type="button" class="settings-btn" onclick="closeSettingsOverlay()">Cancel</button>
+                    <button type="button" id="btnSubmit" class="settings-btn primary" onclick="saveSettings(); closeSettingsOverlay(); loadTrackersAndPoints()">Apply</button>
+                </div>
             </div>
         </div>
 
@@ -4190,9 +5086,10 @@
                     <button type="button" id="nextTravelSegmentBtn" onclick="event.stopPropagation(); navigateTravelSegment(1)" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()">→</button>
                 </div>
                 <div id="segmentTimeframe" class="segment-timeframe">No segment selected</div>
+                <button type="button" id="segmentDebugToggleButton" class="segment-debug-toggle" onclick="event.stopPropagation(); toggleSegmentDebugVisibility()" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()" aria-pressed="false" title="Show point navigation and copy controls">Show Debug</button>
                 <div id="segmentDebugControls" class="segment-debug-controls" onpointerdown="event.stopPropagation()" onpointerup="event.stopPropagation()" onclick="event.stopPropagation()">
-                    <button type="button" id="prevSegmentPointBtn" onclick="navigateSegmentPoint(-1)">Point ←</button>
                     <span id="segmentPointCounter" class="segment-point-counter">Point 0 / 0</span>
+                    <button type="button" id="prevSegmentPointBtn" onclick="navigateSegmentPoint(-1)">Point ←</button>
                     <button type="button" id="nextSegmentPointBtn" onclick="navigateSegmentPoint(1)">Point →</button>
                     <button type="button" id="copySegmentPointBtn" onclick="copyCurrentSegmentDebugInfo('point')">Copy Point</button>
                     <button type="button" id="copySegmentStopBtn" onclick="copyCurrentSegmentDebugInfo('stop')">Copy Stop</button>

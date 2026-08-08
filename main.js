@@ -21,10 +21,20 @@ const mqttManualUpdates = require("./mqtt");
 
 
 const pointsDB = new pointsDBConnector();
+const PORT = parseInt(process.env.PORT, 10) || 3000;
 
-app.listen(3000, () => {
-  console.log(`App listening on port 3001`)
-})
+const server = app.listen(PORT, () => {
+  console.log(`App listening on port ${PORT}`);
+});
+
+server.on("error", (err) => {
+  if (err && err.code === "EADDRINUSE") {
+    console.error(`Port ${PORT} is already in use. Stop the existing process or choose another PORT.`);
+  } else {
+    console.error("Failed to start server:", err);
+  }
+  process.exit(1);
+});
 
 app.use((req, res, next) => {
   const start = Date.now();
